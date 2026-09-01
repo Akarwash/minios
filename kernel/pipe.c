@@ -2,6 +2,7 @@
 #include "file.h"               // FILE_BLOCKED, FILE_ERR
 #include "scheduler.h"          // task_block, scheduler_wake, WAIT_PIPE_*
 #include "heap.h"
+#include "signal.h"            // signal_raise, for SIGPIPE on a dead pipe
 
 // ============================================================================
 // Pipes: the ring buffer, and the block/wake/EOF rules.
@@ -53,7 +54,14 @@ long pipe_read(pipe_t *p, char *buf, uint32_t len, registers_t *r) {
     // still open, the bytes may yet come, so wait for them. If not, no byte can ever
     // arrive, and that is EOF.
     if (p->writers > 0) {
-        task_block(r, WAIT_PIPE_READ);
+        // A signal can cut this short instead of parking us: task_block reports that
+        // rather than blocking, and the read fails so the signal can be delivered on
+        // the way out. Without it, Ctrl-C on a task blocked reading a pipe would wake
+        // it, have it re-issue the read, find the pipe still empty — a signal is not
+        // data — and block again, forever (S5).
+        if (task_block(r, WAIT_PIPE_READ) == TASK_BLOCK_INTERRUPTED) {
+            return FILE_ERR;
+        }
         return FILE_BLOCKED;      // parked; the caller must not touch rax
     }
     return 0;                     // EOF
@@ -61,16 +69,31 @@ long pipe_read(pipe_t *p, char *buf, uint32_t len, registers_t *r) {
 
 long pipe_write(pipe_t *p, const char *buf, uint32_t len, registers_t *r) {
     // NO READER CAN EVER DRAIN THIS PIPE. Blocking would be forever and buffering
-    // would be pointless, so fail. Unix raises SIGPIPE here; an error return is
-    // enough for a kernel with no signals.
+    // would be pointless.
+    //
+    // This used to be a bare error return, which was all a kernel with no signals
+    // could do — and it was not enough. A writer that ignores a failed write (and
+    // sys_print's loop stops on one, but a program written differently need not)
+    // spins against a dead pipe forever, and `run g.elf | run <a reader that exits
+    // early>` never terminates. A signal reaches a program that is not checking
+    // return values; an error return only reaches one that is.
+    //
+    // SIG_PIPE's default action is to kill the writer, which is what makes that
+    // pipeline finish. It is CATCHABLE, deliberately: a program that wants to handle
+    // a vanished reader itself installs a handler, and then this error return is what
+    // it sees. That is why the default is kill rather than an unconditional one.
     if (p->readers == 0) {
+        signal_raise(scheduler_current_id(), SIG_PIPE);
         return FILE_ERR;
     }
 
     uint32_t space = pipe_space(p);
     if (space == 0) {
         // Full, but a reader is alive to drain it: park until it does (backpressure).
-        task_block(r, WAIT_PIPE_WRITE);
+        // Interruptible for the same reason the read above is (S5).
+        if (task_block(r, WAIT_PIPE_WRITE) == TASK_BLOCK_INTERRUPTED) {
+            return FILE_ERR;
+        }
         return FILE_BLOCKED;
     }
 

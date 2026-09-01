@@ -2,6 +2,7 @@
 #include "ports.h"
 #include "../kernel/isr.h"
 #include "../kernel/scheduler.h"
+#include "../kernel/signal.h"
 #include "../include/vectors.h"
 
 #define KEYBOARD_DATA_PORT 0x60
@@ -14,6 +15,14 @@
 #define KEY_LSHIFT         0x2A
 #define KEY_RSHIFT         0x36
 #define KEY_CAPSLOCK       0x3A
+#define KEY_LCTRL          0x1D
+
+// The two keys that mean something when ctrl is held. Named as SCANCODES rather
+// than characters because that is what this function has: the ctrl combinations are
+// decided before either ASCII table is consulted, so there is no 'c' to compare
+// against at that point.
+#define KEY_C              0x2E
+#define KEY_D              0x20
 
 // US QWERTY scan code (set 1) to ASCII. Index = scan code, 0 = unmapped/ignored.
 // Key releases (bit 7 set) are handled before either table is consulted.
@@ -63,6 +72,29 @@ static const char scancode_to_ascii_shift[128] = {
 // the press of caps lock toggles and nothing clears.
 static int shift_held = 0;
 static int caps_on    = 0;
+
+// Left ctrl, tracked exactly like shift and for the same reason: it is a state of
+// the hardware, so it is set on press and cleared on release. RIGHT ctrl is NOT
+// tracked, and cannot be until extended scancodes are: it arrives as the two bytes
+// 0xE0 0x1D, and the 0xE0 has bit 7 set, so the release branch below swallows it and
+// the 0x1D that follows is decoded as if it were the left one. That happens to work
+// for right ctrl by accident. See the TODO(extended-scancodes) note further down.
+static int ctrl_held  = 0;
+
+// Set by Ctrl-D, consumed by a console read. This is the ENTIRE line discipline this
+// kernel has: not a mode, not a terminal, one flag meaning "the next console read
+// should report end of input".
+//
+// It exists because a console had no way to say EOF. file_read on an FD_CONSOLE
+// blocks on WAIT_KEY and hands back characters forever, so `run count.elf` on its own
+// — a program whose whole shape is "read until EOF" — could never finish, which is
+// what verification 9 of the pipes rung ran into.
+//
+// ONE FLAG, NOT A COUNT, and it is per-machine rather than per-task, because there is
+// one keyboard. Whichever task reads the console next consumes it. With a single
+// foreground group that is the task the user meant; with real job control it would
+// have to move onto the console descriptor itself.
+static volatile int console_eof = 0;
 
 // ---------------------------------------------------------------------------
 // The keyboard ring buffer: a fixed circular queue between the keyboard IRQ
@@ -114,6 +146,17 @@ static void kbd_buffer_push(char c) {
 // 0 is a safe "nothing waiting" sentinel: the scancode table maps every unmapped
 // key to 0 and keyboard_callback only pushes non-zero characters, so a real 0 never
 // enters the ring and cannot be mistaken for "empty".
+int keyboard_console_eof(void) {
+    // Test-and-clear, so an EOF is delivered to exactly one read. Leaving the flag
+    // set would turn one Ctrl-D into a console that reports EOF forever, and every
+    // subsequent reader would see end-of-input it never asked for.
+    if (!console_eof) {
+        return 0;
+    }
+    console_eof = 0;
+    return 1;
+}
+
 int keyboard_getchar(void) {
     if (kbd_read_index == kbd_write_index) {
         return 0;   // empty: the consumer has caught up to the producer
@@ -175,6 +218,9 @@ static void keyboard_callback(registers_t *regs) {
         if (released == KEY_LSHIFT || released == KEY_RSHIFT) {
             shift_held = 0;
         }
+        if (released == KEY_LCTRL) {
+            ctrl_held = 0;
+        }
         return;
     }
 
@@ -189,6 +235,48 @@ static void keyboard_callback(registers_t *regs) {
     }
     if (scancode == KEY_CAPSLOCK) {
         caps_on = !caps_on;
+        return;
+    }
+    if (scancode == KEY_LCTRL) {
+        ctrl_held = 1;
+        return;
+    }
+
+    // The two ctrl combinations this kernel understands. BOTH RETURN BEFORE THE
+    // CHARACTER PATH BELOW, exactly as the modifier presses do, and for the same
+    // two reasons: neither pushes a character (Ctrl-C is not a 'c' the shell should
+    // echo, and Ctrl-D is not a 'd'), and neither may fall through to the
+    // scheduler_wake(WAIT_KEY) at the bottom on a keystroke that put nothing in the
+    // buffer. A wake with an empty ring hands every WAIT_KEY sleeper a wasted round
+    // trip: woken, re-issue the read, find nothing, block again. Holding ctrl and
+    // tapping c would spin the scheduler doing that.
+    if (ctrl_held) {
+        if (scancode == KEY_C) {
+            // Ctrl-C: interrupt the FOREGROUND GROUP — the job the person is
+            // looking at — and not the running task. The task the keyboard IRQ
+            // happens to interrupt is whatever the round-robin reached, which on a
+            // machine running a background program is routinely not the job the user
+            // means. A job is a group precisely so this key can name it.
+            signal_raise_group(scheduler_foreground_pgid(), SIG_INT);
+            return;
+        }
+        if (scancode == KEY_D) {
+            // Ctrl-D: end of input on the console. Set the flag, then wake the
+            // WAIT_KEY sleepers — the SAME ordering, and for the same reason, as the
+            // push/wake pair at the bottom of this function. A task woken before the
+            // flag was set would re-issue its read, find neither a character nor an
+            // EOF, and block again, turning the keystroke into a wasted round trip.
+            //
+            // This wake is not the empty-ring case warned about above: there IS
+            // something for a console reader to find, just not a character.
+            console_eof = 1;
+            scheduler_wake(WAIT_KEY);
+            return;
+        }
+        // Any other key with ctrl held produces nothing. Falling through to the
+        // character path would make Ctrl-A type a plain 'a', which is not what the
+        // user asked for and would put a character in the buffer they cannot see
+        // they typed.
         return;
     }
 

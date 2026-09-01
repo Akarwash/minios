@@ -64,6 +64,19 @@ static int map_user_stack(address_space_t *as) {
 // Index of the task currently on the CPU.
 static uint32_t current = 0;
 
+// Forward declaration: task_create_from_file checks a group request long before the
+// permission rule itself is defined, and the rule wants to sit beside the other two
+// group functions rather than at the top of the file.
+static int may_use_group(uint32_t caller_id, uint32_t pgid);
+
+// The process group the keyboard talks to. Group 0 is task 0's — the shell's — so
+// at boot Ctrl-C is addressed to the shell, which is the right default: the shell is
+// the only thing running, and it is the thing the person is typing at.
+//
+// It is DECLARED by a task calling SYS_SETFG, never inferred from what was started
+// most recently. See scheduler_set_foreground below and the note in scheduler.h.
+static uint32_t foreground_pgid = 0;
+
 // A HIGH WATER MARK, not a count of live tasks. Tasks are handed ids 0, 1, ... in
 // creation order and this only ever grows: reaping a task frees its struct and
 // NULLs its slot, but does NOT decrement this, because doing so would let the next
@@ -104,7 +117,8 @@ static int scheduler_running = 0;
 // a zombie still has anybody who might read its exit status.
 //
 // Returns the task id, or -1 if the heap is full or the task table is.
-static int task_register(address_space_t *as, uint64_t entry, uint32_t parent_id) {
+static int task_register(address_space_t *as, uint64_t entry, uint32_t parent_id,
+                         uint32_t pgid_req) {
     if (num_tasks >= MAX_TASKS_LIMIT) {
         return -1;                          // bookkeeping array full (arbitrary cap)
     }
@@ -161,6 +175,28 @@ static int task_register(address_space_t *as, uint64_t entry, uint32_t parent_id
     t->wait_reason = WAIT_NONE;   // only meaningful once the task blocks
     t->parent_id = parent_id;     // who to wake and who may read the status below
     t->exit_status = 0;           // only meaningful once the task is a TASK_ZOMBIE
+    t->sig_pending = 0;           // nothing raised on a task that has not run yet
+    t->sig_trampoline = 0;        // supplied by the program's first SYS_SIGNAL
+    t->sig_active = 0;            // no handler running
+    t->sig_interrupted = 0;       // no syscall cut short
+    t->sig_ctx = 0;               // only meaningful while sig_active
+    for (int i = 0; i < MAX_SIGS; i++) {
+        t->sig_handlers[i] = 0;   // 0 = no handler = take the default action
+    }
+
+    // The group. TASK_PGID_NEW names the group after this task, which is both the
+    // Unix convention and, here, what makes a fresh group id unique without a
+    // counter: ids are never reused, so no live group can already be called this.
+    // The caller has already checked that any OTHER request is one it is allowed to
+    // make (see task_create_from_file), so by this point pgid_req is either a
+    // sentinel or a permitted group.
+    if (pgid_req == TASK_PGID_NEW) {
+        t->pgid = id;
+    } else if (pgid_req == TASK_PGID_INHERIT) {
+        t->pgid = (parent_id == TASK_NO_PARENT) ? 0u : tasks[parent_id]->pgid;
+    } else {
+        t->pgid = pgid_req;
+    }
 
     // Install the console descriptors allocated above and clear the rest of the
     // table. From here the task can read fd 0 and write fd 1 the instant it runs.
@@ -172,7 +208,21 @@ static int task_register(address_space_t *as, uint64_t entry, uint32_t parent_id
     return (int)id;
 }
 
-int task_create_from_file(const char *name, uint32_t parent_id, int in_fd, int out_fd) {
+int task_create_from_file(const char *name, uint32_t parent_id, int in_fd, int out_fd,
+                          uint32_t pgid_req) {
+    // (0a) A request to join a NAMED existing group is checked FIRST, before any
+    // resource is taken, under the same rule that governs the foreground. A request
+    // the caller may not make fails the create outright rather than quietly falling
+    // back to inheritance: a shell that asked for a job group and got its own would
+    // build a job whose stages Ctrl-C reaches individually, and would have no way to
+    // find out. The two sentinels need no check — inheriting is always allowed, and a
+    // new group named after a task that does not exist yet cannot collide with
+    // anything.
+    if (pgid_req != TASK_PGID_INHERIT && pgid_req != TASK_PGID_NEW &&
+        !may_use_group(parent_id, pgid_req)) {
+        return -1;
+    }
+
     // (0) Resolve any inherited descriptors against the CALLER's table FIRST, before
     // building anything, so a bad fd fails with nothing to undo. -1 means "fresh
     // console" (the default fds task_register makes), so only a real fd is resolved,
@@ -261,7 +311,7 @@ int task_create_from_file(const char *name, uint32_t parent_id, int in_fd, int o
         }
     }
 
-    int id = task_register(as, entry, parent_id);
+    int id = task_register(as, entry, parent_id, pgid_req);
     if (id < 0) {
         // Out of kernel heap, or the bookkeeping array is full. The tree was built
         // perfectly; there is simply nowhere to record the task that would own it,
@@ -296,6 +346,69 @@ uint32_t scheduler_current_id(void) {
     // stamps the new task's parent_id with it), so the id is exported and the table
     // is not.
     return current;
+}
+
+// May `caller_id` use `pgid` — as the foreground group, or as the group to put a
+// child into? This is decision 3 of the signals rung, and it is the rule that keeps
+// the keyboard reachable.
+//
+// A task may name its OWN group, or a group at least one of its OWN CHILDREN is
+// already in. Nothing else. WITHOUT THIS RULE ANY PROGRAM COULD TAKE THE KEYBOARD
+// AND NEVER GIVE IT BACK: it would name some other group as the foreground, every
+// Ctrl-C from then on would be addressed to tasks the user is not looking at, and no
+// key would reach the shell to undo it. There is no privileged task here that could
+// take it back, so the rule has to hold at the moment the request is made.
+//
+// The child clause is what a shell needs and is the only reason this is not simply
+// "your own group": a shell puts a pipeline in a group of its children and then has
+// to name that group, which is not its own.
+static int may_use_group(uint32_t caller_id, uint32_t pgid) {
+    task_t *caller = (caller_id < num_tasks) ? tasks[caller_id] : NULL;
+    if (caller == NULL) {
+        return 0;
+    }
+    if (caller->pgid == pgid) {
+        return 1;                   // your own group is always yours to name
+    }
+    for (uint32_t i = 0; i < num_tasks; i++) {
+        task_t *t = tasks[i];
+        if (t == NULL || t->state == TASK_ZOMBIE) {
+            continue;               // a reaped hole, or a task that has already exited
+        }
+        if (t->parent_id == caller_id && t->pgid == pgid) {
+            return 1;               // a group one of your children is in
+        }
+    }
+    return 0;
+}
+
+uint32_t scheduler_foreground_pgid(void) {
+    return foreground_pgid;
+}
+
+int scheduler_set_foreground(uint32_t caller_id, uint32_t pgid) {
+    if (!may_use_group(caller_id, pgid)) {
+        return -1;
+    }
+    foreground_pgid = pgid;
+    return 0;
+}
+
+uint32_t scheduler_task_count(void) {
+    // A HIGH-WATER MARK, NOT A LIVE COUNT: ids are never reused and a reaped task
+    // leaves a permanent NULL hole, so this bounds a scan over tasks[] and says
+    // nothing about how many tasks exist. Every caller must skip the holes.
+    return num_tasks;
+}
+
+task_t *scheduler_task_by_id(uint32_t id) {
+    // num_tasks is a high-water mark, not a live count: ids are never reused, so a
+    // reaped task leaves a permanent NULL hole that this must step over rather than
+    // dereference. See the tasks[] declaration above.
+    if (id >= num_tasks) {
+        return NULL;
+    }
+    return tasks[id];
 }
 
 task_t *scheduler_current_task(void) {
@@ -414,7 +527,27 @@ static void idle_until_runnable(void) {
 // and unsearchable.
 #define INT_INSTR_LEN 2
 
-void task_block(registers_t *r, wait_reason_t reason) {
+int task_block(registers_t *r, wait_reason_t reason) {
+    // (0) WAS THIS TASK WOKEN TO RECEIVE A SIGNAL RATHER THAN BECAUSE ITS EVENT
+    // HAPPENED? If so, do not block again: report it, so the caller fails its syscall
+    // with SYSCALL_ERROR and check_signals delivers on the way out.
+    //
+    // THIS IS THE COUNTERPART OF THE RE-ARM IN (2) BELOW, and without it a signal
+    // cannot reach a blocked task at all. The re-arm rewinds rip onto the `int 0x50`
+    // so a woken task re-issues its syscall — but the re-arm does not know WHY the
+    // task was woken. signal_raise readies a blocked task so it can receive a signal;
+    // that task then re-runs its read, finds the pipe still empty (nothing wrote to
+    // it — a signal is not data), arrives back here, and would block again. The task
+    // never reaches ring 3, so check_signals never runs, so the signal is never
+    // delivered, and Ctrl-C on a task blocked reading a pipe silently does nothing.
+    //
+    // Cleared here, so one signal cuts one syscall short. See S5 in
+    // docs/decisions/0023-signals.md, and the matching comment in signal_raise.
+    if (tasks[current]->sig_interrupted) {
+        tasks[current]->sig_interrupted = 0;
+        return TASK_BLOCK_INTERRUPTED;
+    }
+
     // (1) Take this task out of the rotation and record what it is waiting for, so
     // the waker for that event can find it again (see scheduler_wake).
     tasks[current]->state = TASK_BLOCKED;
@@ -464,7 +597,9 @@ void task_block(registers_t *r, wait_reason_t reason) {
     schedule(r);
 
     // Unreachable on the blocking path: schedule() redirected the pile, so this
-    // kernel entry now belongs to another task and ends at that iretq.
+    // kernel entry now belongs to another task and ends at that iretq. The return
+    // exists only to satisfy the compiler.
+    return 0;
 }
 
 void scheduler_wake(wait_reason_t reason) {
@@ -765,7 +900,13 @@ void task_wait(registers_t *r) {
     // writing 0 (a perfectly ordinary "child exited successfully" status) would make
     // the woken parent kill itself instead of reporting the result. The shell is
     // usually that parent.
-    task_block(r, WAIT_CHILD);
+    // Interruptible, like every other block: a signal wakes the waiter to receive it
+    // and SYS_WAIT fails, rather than the shell re-issuing the wait forever with the
+    // signal undelivered (S5). SYSCALL_ERROR is already this call's "no children"
+    // answer, and a shell that handles that handles this.
+    if (task_block(r, WAIT_CHILD) == TASK_BLOCK_INTERRUPTED) {
+        r->rax = (uint64_t)-1;
+    }
 }
 
 void schedule(registers_t *r) {

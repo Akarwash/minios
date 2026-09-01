@@ -321,8 +321,9 @@ and are mapped user-accessible by `paging_map_page`. See
 The kernel test fixtures (`user/tests/`) each call `SYS_WRITE` with a
 single-letter string a fixed number of times, with a crude busy-wait delay
 between writes, and then call `SYS_EXIT`. The bound is not cosmetic: the shell
-blocks in `SYS_WAIT` until its child is done, and there is no way to kill a task
-and no signals, so a program that looped forever would leave the shell unusable
+blocks in `SYS_WAIT` until its child is done. A program that loops forever can now
+be stopped with Ctrl-C or `kill` (see [signals.md](signals.md)); before signals it
+would leave the shell unusable
 until a reboot. See [user/tests/README.md](../../user/tests/README.md).
 
 **They can no longer be started together.** The old demo — three programs
@@ -386,3 +387,54 @@ half (see [paging.md](paging.md)).
   [paging.md](paging.md).
 - The fixed user virtual layout each task's stack sits in:
   [memory-map.md](memory-map.md).
+
+## Process groups, and signals in the scheduler
+
+`task_t` carries a `pgid`: the process group it belongs to. A group is the unit a
+signal from the keyboard is addressed to, because a pipeline is several tasks and one
+job to the person who typed it. It is inherited from the parent unless `SYS_RUN` asks
+for something else, and a new group is **named after the task that leads it** — which
+makes a fresh group id unique for free, since task ids are never reused.
+
+The scheduler owns two things signals need and nothing else does:
+
+- **`foreground_pgid`**, the group the keyboard talks to, changed only through
+  `scheduler_set_foreground` and only by a task allowed to name that group (its own,
+  or one of its children's). Without that rule any program could take the keyboard
+  and never give it back, and no privileged task exists here that could take it away.
+- **`scheduler_task_by_id` and `scheduler_task_count`**, so `kernel/signal.c` can
+  reach a task that is *not* the running one — the whole point of a signal — without
+  the task table leaving this file.
+
+### `task_block` gained a return value
+
+This is the one place the blocking design and signals meet, and it is subtle enough
+to be worth stating here as well as in [blocking.md](blocking.md) and
+[signals.md](signals.md).
+
+```c
+int task_block(registers_t *r, wait_reason_t reason);   // 0, or TASK_BLOCK_INTERRUPTED
+```
+
+The re-arm — rewinding `rip` onto the `int 0x50` so a woken task re-issues its
+syscall — does not know *why* a task was woken. A task woken to receive a signal
+would re-run its read, find nothing changed (a signal is not data), and block again,
+forever, with the signal undelivered. So `signal_raise` sets `sig_interrupted` when
+it readies a blocked task, and `task_block` reports it instead of parking. The
+syscall then fails with `SYSCALL_ERROR` and `check_signals` delivers on the way out.
+
+Every blocking call honours it. A new one must too.
+
+### Delivery and the sweeper
+
+`check_signals` runs at the end of `irq_handler`, **after** the per-vector handler.
+For the timer that handler is `schedule()`, which rewrites the register frame in
+place with the incoming task's context — so running the check first would examine the
+outgoing task against the incoming task's frame. Afterwards the frame and `current`
+agree.
+
+A signal's default action calls `task_exit`, so a task killed by a signal dies by
+exactly the same two-phase path as one that called `SYS_EXIT`: paperwork now, freeing
+later from the sweeper or the parent's `SYS_WAIT`. Nothing about reaping changed.
+
+See [decision 0023](../decisions/0023-signals.md).

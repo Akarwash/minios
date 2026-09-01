@@ -2,7 +2,7 @@
 
 TownOS lets a ring-3 program request kernel services through a single software
 interrupt, `int 0x50`. This page documents the gate, the calling convention, the
-fourteen calls that exist, and the pointer checks that guard the untrusted ones. Read
+nineteen calls that exist, and the pointer checks that guard the untrusted ones. Read
 from `kernel/syscall.c`, `kernel/isr_stubs.asm`, `kernel/isr.c`,
 `include/syscalls.h`, `drivers/keyboard.c`, and `user/userlib.h`. For the
 rationale and the alternatives considered, see
@@ -15,7 +15,10 @@ and in [shell.md](shell.md); see
 [decision 0021](../decisions/0021-sys-stat.md). The descriptor calls (`SYS_WRITE` and
 `SYS_READ` on a fd, `SYS_CLOSE`, `SYS_PIPE`) have their own pages,
 [descriptors.md](descriptors.md) and [pipes.md](pipes.md); see
-[decision 0022](../decisions/0022-file-descriptors-and-pipes.md).
+[decision 0022](../decisions/0022-file-descriptors-and-pipes.md). The signal calls
+(`SYS_SIGNAL`, `SYS_KILL`, `SYS_SIGRETURN`, `SYS_SETFG`, `SYS_TASKS`) have their own
+page, [signals.md](signals.md); see
+[decision 0023](../decisions/0023-signals.md).
 
 ## The doorway
 
@@ -62,7 +65,7 @@ not do (kernel pages are not user-readable).
 | 1 | `SYS_WRITE` | RDI = fd, RSI = buffer, RDX = length | bytes written (may be < length), or -1 | Writes the counted buffer to that descriptor (screen, or a pipe). |
 | 2 | `SYS_READKEY` | none | one character (never 0) | Pops one key from the keyboard ring buffer, sleeping the caller until one arrives. |
 | 3 | `SYS_LIST` | RDI = buffer, RSI = size | number of names, or -1 | Writes the root directory's file names into the buffer, newline-separated. |
-| 4 | `SYS_RUN` | RDI = filename, RSI = in_fd, RDX = out_fd (-1 = fresh console) | child's task id, or -1 | Loads and starts the named program, giving it those descriptors as fd 0/1. |
+| 4 | `SYS_RUN` | RDI = filename, RSI = in_fd, RDX = out_fd (-1 = fresh console), RCX = group request | child's task id, or -1 | Loads and starts the named program, giving it those descriptors as fd 0/1 and putting it in the requested process group. |
 | 5 | `SYS_READFILE` | RDI = filename, RSI = buffer, RDX = size | bytes read, or -1 | Reads a whole file into the buffer. |
 | 6 | `SYS_WAIT` | RDI = `uint64_t *out_id` or 0 | a child's exit status (0..255), or -1 | Blocks until any child exits; reports its id through out_id when nonzero. |
 | 7 | `SYS_WRITEFILE` | RDI = filename, RSI = buffer, RDX = length | 0 on success, -1 on failure | Creates or wholly replaces a file with the buffer's bytes. |
@@ -72,6 +75,28 @@ not do (kernel pages are not user-readable).
 | 11 | `SYS_READ` | RDI = fd, RSI = buffer, RDX = length | bytes read, 0 at EOF, or -1 | Reads from that descriptor (keyboard, or a pipe); blocks when there is nothing yet. |
 | 12 | `SYS_CLOSE` | RDI = fd | 0, or -1 on a bad fd | Closes the descriptor; a pipe end's close may wake a peer or free the pipe. |
 | 13 | `SYS_PIPE` | RDI = `int[2]` out | 0 (writes `[read_fd, write_fd]`), or -1 | Creates a pipe and puts its two ends in the caller's table. |
+| 14 | `SYS_SIGNAL` | RDI = signal, RSI = handler (0 = default), RDX = trampoline | 0, or -1 | Installs a ring-3 handler for that signal on the calling task. `SIG_KILL` is refused. |
+| 15 | `SYS_KILL` | RDI = task id, RSI = signal | 0, or -1 | Raises that signal on that task. |
+| 16 | `SYS_SIGRETURN` | none | does not return normally | Restores the context saved when a handler was delivered. Only the trampoline calls it. |
+| 17 | `SYS_SETFG` | RDI = pgid | 0, or -1 | Makes that process group the foreground, the one Ctrl-C is addressed to. |
+| 18 | `SYS_TASKS` | RDI = `task_info_t` buffer, RSI = size | number of entries, or -1 | Fills the buffer with one entry per live task. |
+
+**`SYS_RUN` grew a fourth argument in RCX**, the process group the child joins: 0 to
+inherit the caller's (the old behaviour), `SYS_RUN_GROUP_NEW` for a new group led by
+the child, or an existing group id to join. The three arguments already there keep
+exactly their old meanings and values, so every existing call site means what it
+always did. RCX rather than R10 because this kernel enters through `int 0x50`, which
+— unlike the `syscall` instruction — does not clobber it, so the fourth argument sits
+where the System V C ABI already puts it. A group the caller may not join **fails the
+run** rather than quietly inheriting: a half-built job group is not something a
+caller could detect afterwards.
+
+**A blocking call can now return -1 because a signal arrived.** When a signal is
+raised on a task parked in a syscall, the kernel wakes it, fails the call, and
+delivers the handler on the way out — deliberately, so the call cannot silently
+re-issue and swallow the signal. `SYS_READKEY`, `SYS_READ`, `SYS_WRITE` and
+`SYS_WAIT` are all affected. A caller must not treat that -1 as data; see
+[signals.md](signals.md).
 
 `SYS_EXIT` **ends the calling task**, and no longer halts the machine. That was
 what it meant when there was no scheduler and no parent to return to; now the task

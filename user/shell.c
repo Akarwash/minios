@@ -14,6 +14,7 @@
 // kernel_main. See docs/reference/shell.md.
 
 #include "userlib.h"
+#include "../include/taskinfo.h"
 
 // The line buffer is fixed. If it fills, further printable characters are DROPPED
 // rather than accepted, so a long line cannot overflow it; one slot is reserved
@@ -44,7 +45,19 @@
 
 // Static (in .bss, inside the ring-3 region), not on the stack: the file buffer is
 // large, and keeping these off the 256KB user stack leaves it for call frames.
+// How many tasks `ps` will report at once. MAX_TASKS_LIMIT in the kernel is 64, so
+// this covers every task the machine can have; SYS_TASKS truncates rather than
+// failing if it ever does not.
+#define SHELL_MAX_TASKS  64
+
 static char line[SHELL_LINE_MAX];
+
+// Set by the handler, read and cleared by read_line. A handler cannot reach
+// read_line's local length counter, and abandoning the half-typed line is most of
+// what "Ctrl-C at a prompt" MEANS: without this the fresh prompt is cosmetic, the
+// characters already typed are still in the buffer, and the next thing the user
+// types is appended to them. Volatile because nothing the compiler can see writes it.
+static volatile int line_abandoned;
 static char list_buf[SHELL_LIST_MAX];
 static char file_buf[SHELL_FILE_MAX];
 
@@ -139,6 +152,115 @@ static void print_help(void) {
     sys_print("  help                 show this list\n");
     sys_print("  clear                clear the screen\n");
     sys_print("  return <text>        print the text back\n");
+    sys_print("  ps                   list the running tasks\n");
+    sys_print("  kill <id> [sig]      send a signal to a task (default 2, interrupt)\n");
+}
+
+// Parse a non-negative decimal number. Returns 0 and sets *ok to 0 on anything that
+// is not entirely digits, so `kill abc` is rejected rather than silently killing
+// task 0 — which is the shell, and which nothing could restart.
+static unsigned long parse_uint(const char *s, int *ok) {
+    unsigned long v = 0;
+    int digits = 0;
+    for (; *s != '\0'; s++) {
+        if (*s < '0' || *s > '9') {
+            *ok = 0;
+            return 0;
+        }
+        v = v * 10 + (unsigned long)(*s - '0');
+        digits++;
+    }
+    *ok = digits > 0;
+    return v;
+}
+
+// The names the TASK_INFO_* states print as. A task's state is the single most
+// useful thing on the line: it says whether a task is doing work, waiting for
+// something, or already dead and merely uncollected.
+static const char *state_name(unsigned long state) {
+    if (state == TASK_INFO_READY)   return "ready";
+    if (state == TASK_INFO_RUNNING) return "running";
+    if (state == TASK_INFO_BLOCKED) return "blocked";
+    if (state == TASK_INFO_ZOMBIE)  return "zombie";
+    return "?";
+}
+
+// `ps`: list every live task.
+//
+// The pgid column is the one to read when something will not die. Ctrl-C is
+// addressed to the FOREGROUND GROUP only, so a task whose pgid is not the shell's
+// cannot be reached from the keyboard at all — which is exactly what `run d.elf`
+// leaves behind, since D exits without waiting and E carries on in D's group with
+// nobody to hand the keyboard to it. `ps` is how you find it and `kill` is how you
+// stop it; without both, this kernel has tasks that nothing can stop.
+static void cmd_ps(void) {
+    task_info_t tasks[SHELL_MAX_TASKS];
+    unsigned long n = syscall2(SYS_TASKS, (unsigned long)tasks, sizeof(tasks));
+    if (n == SYS_FAIL) {
+        sys_print("ps: could not read the task table\n");
+        return;
+    }
+
+    sys_print("  id  parent  pgid  state    status\n");
+    for (unsigned long i = 0; i < n; i++) {
+        sys_print("  ");
+        print_uint(tasks[i].id);
+        sys_print("   ");
+        // A task nobody started has no parent to name. The kernel's sentinel for that
+        // is 0xFFFFFFFF, which printed as a number is nine digits of noise.
+        if (tasks[i].parent_id == 0xFFFFFFFFu) {
+            sys_print("-");
+        } else {
+            print_uint(tasks[i].parent_id);
+        }
+        sys_print("       ");
+        print_uint(tasks[i].pgid);
+        sys_print("     ");
+        sys_print(state_name(tasks[i].state));
+        // Only a zombie has a status worth printing; for anything else the field is 0
+        // and means nothing at all.
+        if (tasks[i].state == TASK_INFO_ZOMBIE) {
+            sys_print("   ");
+            print_uint((unsigned long)tasks[i].exit_status);
+        }
+        sys_print("\n");
+    }
+}
+
+// `kill <id> [sig]`: send a signal to a task by id, defaulting to SIG_INT — the
+// same signal Ctrl-C sends, so `kill <id>` is "Ctrl-C, but aimed".
+//
+// Pass 9 (SIG_KILL) for a task that has a handler and declines to stop: SIG_KILL
+// cannot be caught, which is the whole reason it exists. A catchable signal is a
+// request.
+static void cmd_kill(char *id_tok, char *sig_tok) {
+    if (id_tok == (char *)0) {
+        sys_print("kill: missing task id (try 'ps')\n");
+        return;
+    }
+    int ok = 0;
+    unsigned long id = parse_uint(id_tok, &ok);
+    if (!ok) {
+        sys_print("kill: task id must be a number\n");
+        return;
+    }
+
+    unsigned long sig = SIG_INT;
+    if (sig_tok != (char *)0) {
+        sig = parse_uint(sig_tok, &ok);
+        if (!ok) {
+            sys_print("kill: signal must be a number\n");
+            return;
+        }
+    }
+
+    if (sys_kill(id, (int)sig) == SYS_FAIL) {
+        // A bad id is reported rather than passed over in silence: "nothing happened"
+        // and "there was nothing there" look identical otherwise, and the second is
+        // the one a user needs to know about.
+        sys_print("kill: no such task, or not a signal this kernel has\n");
+        return;
+    }
 }
 
 static void cmd_list(void) {
@@ -263,12 +385,24 @@ static void cmd_delete(char *name) {
     }
 }
 
+// The shell's own process group. The shell is task 0 and a group is named after its
+// leader, so the shell's group is 0 — the value the foreground starts at, and the
+// value it must be restored to every time a job ends.
+//
+// Named rather than written as a bare 0 at the two call sites, because `sys_setfg(0)`
+// reads as "clear the foreground" and it is not: it is "the shell is in front again".
+#define SHELL_PGID  0UL
+
 static void cmd_run(char *name) {
     if (name == (char *)0) {
         sys_print("run: missing filename\n");
         return;
     }
-    if (sys_run(name, -1, -1) == SYS_FAIL) {   // -1/-1: a plain run, fresh console, no pipe
+    // A JOB OF ITS OWN. Even a single program gets a new process group, so Ctrl-C
+    // while it runs is addressed to it and not to this shell. The returned task id is
+    // that group's id, because a group is named after the task that leads it.
+    unsigned long id = sys_run_group(name, -1, -1, SYS_RUN_GROUP_NEW);
+    if (id == SYS_FAIL) {   // -1/-1: a plain run, fresh console, no pipe
         sys_print("run: could not start ");
         sys_print(name);
         sys_print("\n");
@@ -285,11 +419,17 @@ static void cmd_run(char *name) {
     // detach: the prompt does not come back until the program is finished, because
     // this call blocks until it is. Costs no CPU while it waits (see sys_wait).
     //
-    // THE CHILD MUST EXIT. There is no way to kill a task and there are no signals,
-    // so if the program never calls sys_exit, this shell blocks here forever and the
-    // only way back is a reboot. That is why every program in user/ has a bounded
-    // loop.
+    // THE CHILD NO LONGER HAS TO EXIT ON ITS OWN. This used to be a trap: a program
+    // that never called sys_exit blocked this shell here forever with a reboot the
+    // only way back. Ctrl-C is addressed to the job's group (set just above), so an
+    // unbounded program can be stopped, and `kill` reaches one the keyboard cannot.
+    // The fixtures in user/ keep their bounded loops regardless, so they can be run
+    // unattended.
+    // Hand the keyboard to the job, wait for it, and take it back. sys_setfg is the
+    // declaration that this group is what Ctrl-C means from here until the job ends.
+    sys_setfg(id);
     long status = sys_wait();
+    sys_setfg(SHELL_PGID);   // unconditional: see the note on SHELL_PGID
 
     // Any real status is 0..255 (the kernel masks it), so a negative return is the
     // error case and cannot be confused with a program that exited 255. It means the
@@ -338,7 +478,31 @@ static void read_line(void) {
         // per keystroke and the shell costs nothing while the user is thinking. It
         // used to spin here, calling a non-blocking read over and over and burning
         // every slice it was given; the kernel now sleeps the task instead.
-        char c = (char)sys_readkey();
+        unsigned long key = sys_readkey();
+
+        // A SIGNAL CUTS THIS CALL SHORT, and that is a real answer, not a key. When a
+        // signal is raised on a task blocked in a syscall the kernel wakes it,
+        // fails the call with SYS_FAIL, and delivers the handler on the way out
+        // (decision 9 of the signals rung) — precisely so the call cannot silently
+        // re-issue and swallow the signal. From here that looks like sys_readkey
+        // returning -1, and treating it as a character appends 0xFF to the line: the
+        // symptom is a Ctrl-C at the prompt leaving invisible junk in the buffer, so
+        // the next command typed is rejected as unknown for no visible reason.
+        //
+        // The handler has already run by the time this returns. Nothing is owed here
+        // but to wait for a real key.
+        if (key == SYS_FAIL) {
+            continue;
+        }
+
+        // The handler ran, so throw away whatever had been typed. Checked here rather
+        // than in the handler because the count lives in this frame; the handler can
+        // only raise the flag.
+        if (line_abandoned) {
+            line_abandoned = 0;
+            len = 0;
+        }
+        char c = (char)key;
 
         if (c == '\n') {
             sys_print("\n");   // echo the newline that ends the line
@@ -386,7 +550,7 @@ static int line_has_pipe(const char *s) {
 // they cannot be a stage. `in_fd`/`out_fd` are the descriptors the child gets as its
 // fd 0 and fd 1 (-1 for a fresh console). Returns the child's task id (>= 1), or -1
 // on a parse error or a launch failure. `seg` is tokenized in place.
-static long start_segment(char *seg, int in_fd, int out_fd) {
+static long start_segment(char *seg, int in_fd, int out_fd, unsigned long pgid) {
     char *pos = seg;
     char *cmd = next_token(&pos, ' ');
     if (cmd == (char *)0 || !str_eq(cmd, "run")) {
@@ -398,7 +562,7 @@ static long start_segment(char *seg, int in_fd, int out_fd) {
         sys_print("pipe: run needs a filename\n");
         return -1;
     }
-    unsigned long ret = sys_run(name, in_fd, out_fd);
+    unsigned long ret = sys_run_group(name, in_fd, out_fd, pgid);
     if (ret == SYS_FAIL) {
         sys_print("pipe: could not start ");
         sys_print(name);
@@ -438,6 +602,7 @@ static void run_pipeline(void) {
     int in_fd = -1;         // the read end the current stage inherits (from the last pipe)
     long last_id = -1;      // task id of the last stage, whose status is the pipeline's
     int started = 0;        // how many stages actually launched (so we wait for exactly that many)
+    unsigned long job_pgid = 0;   // the job's group; 0 until the first stage leads one
 
     for (int i = 0; i < n; i++) {
         int out_fd = -1;
@@ -455,7 +620,12 @@ static void run_pipeline(void) {
             next_in = p[0];
         }
 
-        long id = start_segment(seg[i], in_fd, out_fd);
+        // EVERY STAGE OF A PIPELINE IS IN ONE GROUP. The first stage asks for a new
+        // group and leads it; the rest join the id it was given. That is what makes
+        // Ctrl-C reach all three stages of `run a | run b | run c` — they are three
+        // tasks and one job, and the group is the only thing that says so.
+        long id = start_segment(seg[i], in_fd, out_fd,
+                                (job_pgid == 0) ? SYS_RUN_GROUP_NEW : job_pgid);
 
         // THESE TWO CLOSES ARE LOAD-BEARING (B1). The shell created the pipe, so it
         // holds BOTH ends; once the child has its copies the shell must drop its own,
@@ -483,6 +653,9 @@ static void run_pipeline(void) {
             goto drain;
         }
 
+        if (job_pgid == 0) {
+            job_pgid = (unsigned long)id;   // the first stage leads, and names, the group
+        }
         if (i == n - 1) {
             last_id = id;               // the last stage's status is the pipeline's
         }
@@ -490,6 +663,13 @@ static void run_pipeline(void) {
     }
 
 drain:
+    // Give the keyboard to the job before waiting for it, so Ctrl-C reaches the
+    // pipeline rather than this shell. If no stage started there is no group to hand
+    // it to, and the shell simply keeps it.
+    if (job_pgid != 0) {
+        sys_setfg(job_pgid);
+    }
+
     // Reap every stage that started, so no zombie is left behind, and keep the status
     // of the one whose id matches the last stage.
     {
@@ -507,12 +687,48 @@ drain:
             sys_print("\n");
         }
     }
+
+    // TAKE THE KEYBOARD BACK, UNCONDITIONALLY. This runs whether the pipeline
+    // succeeded, failed to start, or was killed by the Ctrl-C that was addressed to
+    // it — every path through this function reaches here, including the `goto drain`
+    // ones. A shell that only restores the foreground on success loses the keyboard
+    // the first time anything goes wrong, and there is nothing that could give it
+    // back: the group it handed control to is gone, so no key can reach anything.
+    sys_setfg(SHELL_PGID);
 }
 
 // The entry point named by user.ld's ENTRY(_start). The loader takes the entry
 // address from the ELF header, so this symbol only has to match the linker script.
+// The shell's own SIG_INT handler, and the reason it exists is defensive rather
+// than featureful.
+//
+// Ctrl-C is addressed to the foreground group, and the shell hands that over to
+// every job it starts and takes it back afterwards, so in the ordinary case Ctrl-C
+// never reaches here at all. But "the ordinary case" is doing a lot of work in that
+// sentence: at an idle prompt the foreground IS the shell's group, and if a
+// sys_setfg ever failed, or a future edit forgot one, Ctrl-C would arrive here too.
+//
+// Without a handler the default action applies and the shell — task 0 — is killed.
+// Nothing waits on task 0, so there is not even a reap line; the machine simply
+// stops responding, with no shell and no way to start one. That is the whole failure
+// mode, and it is why this is not optional politeness.
+//
+// So the shell does what every real shell does with an interrupt at a prompt:
+// abandon the line and give a fresh one. The prompt is printed here rather than left
+// to the main loop because the loop is blocked inside read_line when this runs, and
+// will resume there rather than at the top.
+static void on_interrupt(int sig) {
+    (void)sig;
+    line_abandoned = 1;
+    sys_print("\n> ");
+}
+
 void _start(void) {
     sys_print("TownOS shell. type 'help'.\n");
+
+    // Install it before the first prompt, so there is no window in which a Ctrl-C
+    // would find the shell defenceless.
+    sys_signal(SIG_INT, on_interrupt);
 
     for (;;) {
         sys_print("> ");
@@ -559,6 +775,12 @@ void _start(void) {
             cmd_clear();
         } else if (str_eq(cmd, "return")) {
             cmd_return(pos);   // the raw remainder after the "return" token
+        } else if (str_eq(cmd, "ps")) {
+            cmd_ps();
+        } else if (str_eq(cmd, "kill")) {
+            char *id_tok = next_token(&pos, ' ');
+            char *sig_tok = next_token(&pos, ' ');
+            cmd_kill(id_tok, sig_tok);
         } else {
             sys_print("unknown command: ");
             sys_print(cmd);

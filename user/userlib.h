@@ -19,6 +19,7 @@
 
 #include "../include/syscalls.h"
 #include "../include/vectors.h"
+#include "../include/signals.h"
 
 // The raw doorbell. `int $SYSCALL_VECTOR` traps into the kernel's DPL 3 gate.
 // Convention (see include/syscalls.h): RAX = syscall number, RDI = first arg,
@@ -83,6 +84,22 @@ unsigned long syscall3(unsigned long number, unsigned long arg1,
         "int %[vec]"
         : "=a"(ret)
         : "a"(number), "D"(arg1), "S"(arg2), "d"(arg3), [vec] "i"(SYSCALL_VECTOR)
+        : "memory");
+    return ret;
+}
+
+// The four-argument form. RCX is the fourth argument, which is where the System V C
+// ABI already puts it — unlike Linux, which has to use R10 because the `syscall`
+// instruction clobbers RCX. This kernel enters through `int 0x50`, which clobbers
+// nothing, so the natural register is available.
+static inline __attribute__((always_inline))
+unsigned long syscall4(unsigned long number, unsigned long arg1, unsigned long arg2,
+                       unsigned long arg3, unsigned long arg4) {
+    unsigned long ret;
+    __asm__ __volatile__(
+        "int %[vec]"
+        : "=a"(ret)
+        : "a"(number), "D"(arg1), "S"(arg2), "d"(arg3), "c"(arg4), [vec] "i"(SYSCALL_VECTOR)
         : "memory");
     return ret;
 }
@@ -214,6 +231,12 @@ unsigned long sys_list(char *buf, unsigned long size) {
     return syscall2(SYS_LIST, (unsigned long)buf, size);
 }
 
+// The process-group requests SYS_RUN's fourth argument accepts. They are named here
+// rather than written as bare numbers because 0 and -1 as a "group" read as a
+// mistake at a call site.
+#define SYS_RUN_GROUP_INHERIT  0UL             // the caller's own group: the default
+#define SYS_RUN_GROUP_NEW      0xFFFFFFFFUL    // a new group, led by (and named after) the child
+
 // SYS_RUN: load and start the named program; it joins the scheduler alongside this
 // one. `in_fd` and `out_fd` are descriptors in THIS program's table to give the
 // child as its fd 0 and fd 1, or -1 for a fresh console end. Passing pipe ends here
@@ -224,8 +247,43 @@ unsigned long sys_list(char *buf, unsigned long size) {
 // when it waits; an ordinary run just checks for the -1 failure.
 static inline __attribute__((always_inline))
 unsigned long sys_run(const char *name, int in_fd, int out_fd) {
-    return syscall3(SYS_RUN, (unsigned long)name,
-                    (unsigned long)(long)in_fd, (unsigned long)(long)out_fd);
+    return syscall4(SYS_RUN, (unsigned long)name,
+                    (unsigned long)(long)in_fd, (unsigned long)(long)out_fd,
+                    SYS_RUN_GROUP_INHERIT);
+}
+
+// Like sys_run, but places the child in a chosen PROCESS GROUP rather than the
+// caller's own. Pass SYS_RUN_GROUP_NEW to start a new group led by the child — the
+// returned task id IS that group's id, since a group is named after its leader — or
+// an existing group id to add the child to a job already under way.
+//
+// This is how a shell builds a job: the first stage of a pipeline asks for a new
+// group, and every later stage joins the id the first one returned. Ctrl-C is then
+// addressed to that one group and reaches every stage, which is what makes a
+// pipeline behave as the single thing the user typed.
+//
+// Returns the child's task id, or (unsigned long)-1. A group the caller is not
+// allowed to join FAILS THE RUN rather than quietly falling back to inheritance: a
+// half-built job group is not something a caller can detect afterwards.
+static inline __attribute__((always_inline))
+unsigned long sys_run_group(const char *name, int in_fd, int out_fd, unsigned long pgid) {
+    return syscall4(SYS_RUN, (unsigned long)name,
+                    (unsigned long)(long)in_fd, (unsigned long)(long)out_fd, pgid);
+}
+
+// SYS_SETFG: declare which process group is in the FOREGROUND — the one Ctrl-C is
+// addressed to. Returns 0, or (unsigned long)-1 if this program is not allowed to
+// name that group.
+//
+// A program may name only its own group, or a group one of its own children is in.
+// That rule is what stops any program taking the keyboard and never giving it back.
+// A shell hands the keyboard to a job before waiting for it and takes it back
+// afterwards, unconditionally — including when the job failed or was killed, because
+// a shell that only takes it back on success loses the keyboard the first time
+// anything goes wrong.
+static inline __attribute__((always_inline))
+unsigned long sys_setfg(unsigned long pgid) {
+    return syscall1(SYS_SETFG, pgid);
 }
 
 // SYS_READFILE: read the named file into buf. Returns the number of bytes read, or
@@ -268,6 +326,46 @@ unsigned long sys_freecount(void) {
 static inline __attribute__((always_inline))
 unsigned long sys_stat(const char *name, unsigned long *out_size) {
     return syscall2(SYS_STAT, (unsigned long)name, (unsigned long)out_size);
+}
+
+// The trampoline a signal handler returns through, defined in user/trampoline.asm
+// and linked into every program. A program never calls it; its address is what
+// sys_signal hands the kernel, and the kernel writes it as the handler's return
+// address when it forges the call frame.
+extern void sigreturn_trampoline(void);
+
+// SYS_SIGNAL: install `handler` for `sig` on this program. Pass 0 to restore the
+// default action, which is to be killed with status 128 + sig.
+//
+// The handler is called with the signal number as its argument, on this program's
+// own stack, with everything the signal interrupted saved underneath. Returning from
+// it normally resumes the interrupted code exactly where it was, which is what makes
+// a handled Ctrl-C a pause rather than an end.
+//
+// SIG_KILL CANNOT BE HANDLED and this returns -1 for it. A signal a program can
+// catch is a request; there has to be one that is not, or a program could refuse to
+// die.
+//
+// The trampoline address is the third argument on the wire and is supplied here, so
+// callers never see it. It has to come from the program because there is no
+// kernel-owned page mapped into a program's address space for the kernel to point a
+// return address at. Returns 0, or (unsigned long)-1.
+static inline __attribute__((always_inline))
+unsigned long sys_signal(int sig, void (*handler)(int)) {
+    return syscall3(SYS_SIGNAL, (unsigned long)sig, (unsigned long)handler,
+                    (unsigned long)&sigreturn_trampoline);
+}
+
+// SYS_KILL: raise `sig` on the task with id `id`. Returns 0, or (unsigned long)-1 if
+// there is no such live task or the signal is not one this kernel has.
+//
+// This is how a task the keyboard cannot reach is stopped: Ctrl-C goes to the
+// foreground group only, so a program left running in another group — anything
+// started by a parent that then exited — is unreachable from the keyboard by design.
+// Pair it with sys_tasks, so the id is looked up rather than guessed.
+static inline __attribute__((always_inline))
+unsigned long sys_kill(unsigned long id, int sig) {
+    return syscall2(SYS_KILL, id, (unsigned long)sig);
 }
 
 // A crude busy-wait so the letters do not scroll past faster than the eye can

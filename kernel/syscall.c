@@ -9,6 +9,8 @@
 #include "../fs/fat32.h"
 #include "../libc/mem.h"
 #include "../include/syscalls.h"
+#include "signal.h"
+#include "../include/taskinfo.h"
 
 // The most bytes one SYS_READ or SYS_WRITE moves in a single call. A counted
 // buffer from ring 3 is copied through a kernel staging buffer of this size, so a
@@ -25,21 +27,8 @@ static char io_staging[SYSCALL_IO_MAX];
 // The cap is what stops an unterminated user string from walking off the region.
 #define SYSCALL_NAME_MAX 16
 
-// Is the whole range [ptr, ptr + len) inside the single ring-3 region? This is the
-// security boundary for every syscall that is handed a buffer to write into or a
-// string to read out of. The pointer comes from ring 3 and is UNTRUSTED, so it is
-// checked BEFORE the kernel touches a byte through it (same spirit as the ELF
-// loader's segment bounds check in kernel/elf.c). Unlike the SYS_WRITE stopgap
-// below, this bounds the ENTIRE range, not just the start, and it is careful about
-// overflow: ptr + len can wrap on a crafted length, and a wrapped sum compares as
-// comfortably small, so len is checked against the room above ptr rather than by
-// forming ptr + len.
-static int user_range_ok(uint64_t ptr, uint64_t len) {
-    if (ptr < USER_REGION_START || ptr >= USER_REGION_END) {
-        return 0;
-    }
-    return len <= USER_REGION_END - ptr;
-}
+// user_range_ok moved to kernel/memory.h, beside the region constants it tests,
+// so kernel/signal.c can apply the identical check to a signal frame's destination.
 
 // Copy a NUL-terminated string from ring 3 into a kernel buffer, capping the
 // length so a missing terminator cannot walk out of the region. The start pointer
@@ -284,7 +273,15 @@ static void sys_readkey(registers_t *regs) {
         return;
     }
 
-    task_block(regs, WAIT_KEY);
+    // A signal can cut this short rather than parking the task. task_block reports
+    // that, and this call must then FAIL rather than block again — the woken task
+    // would otherwise re-issue SYS_READKEY, find the buffer still empty (Ctrl-C
+    // pushes no character), and park forever with the signal undelivered (S5).
+    // Writing rax here is correct and required: this is a path with an answer.
+    if (task_block(regs, WAIT_KEY) == TASK_BLOCK_INTERRUPTED) {
+        regs->rax = SYSCALL_ERROR;
+        return;
+    }
 
     // Unreachable on the blocking path: task_block redirected the pile through
     // schedule(), so this kernel entry now belongs to another task and ends at its
@@ -325,7 +322,19 @@ static uint64_t sys_list(uint64_t user_buf, uint64_t bufsize) {
 // child, since nothing can inject one into a running task, so a pipeline hands the
 // pipe ends across here at creation. task_create_from_file validates and inherits
 // them (in_fd must be a read end, out_fd a write end).
-static uint64_t sys_run(uint64_t user_name, uint64_t in_fd, uint64_t out_fd) {
+//
+// RCX = the process group the child joins: 0 to inherit the caller's (the old
+// behaviour, and what a program that has never heard of groups gets), TASK_PGID_NEW
+// for a new group led by the child, or an existing group to join. A FOURTH REGISTER
+// RATHER THAN AN OVERLOADED EXISTING ONE: the three arguments already here keep
+// exactly their old meanings and their old values, so every existing call site means
+// what it always did and 0 is the old behaviour. RCX (not R10) because this kernel
+// enters through `int 0x50`, which unlike the `syscall` instruction does not clobber
+// RCX, so the fourth argument can sit where the System V C ABI already puts it.
+// task_create_from_file rejects a group the caller may not join, and the create fails
+// rather than quietly inheriting.
+static uint64_t sys_run(uint64_t user_name, uint64_t in_fd, uint64_t out_fd,
+                       uint64_t pgid_req) {
     char name[SYSCALL_NAME_MAX];
     if (copy_user_string(user_name, name, sizeof(name)) != 0) {
         print_string("syscall: SYS_RUN rejected a bad filename pointer\n");
@@ -335,7 +344,8 @@ static uint64_t sys_run(uint64_t user_name, uint64_t in_fd, uint64_t out_fd) {
     // for the program it started. The id has to be taken HERE, inside the syscall,
     // because `current` is only the requesting task while its own syscall is being
     // served; by the next timer tick it means somebody else.
-    int id = task_create_from_file(name, scheduler_current_id(), (int)in_fd, (int)out_fd);
+    int id = task_create_from_file(name, scheduler_current_id(), (int)in_fd, (int)out_fd,
+                                   (uint32_t)pgid_req);
     if (id < 0) {
         // REPORT THE FREE FRAME COUNT, not just the failure. A create can fail after
         // it has already built a page-table tree and mapped part of a program into
@@ -527,6 +537,143 @@ static void sys_wait(registers_t *regs) {
     task_wait(regs);
 }
 
+// SYS_SETFG: declare which process group is in the foreground — the one the
+// keyboard's Ctrl-C is addressed to.
+//   RDI = pgid.
+// Returns 0, or SYSCALL_ERROR if the caller is not allowed to name that group.
+//
+// FOREGROUND IS DECLARED, NOT INFERRED, and this call is the whole of the interface.
+// It cannot be derived from SYS_RUN: D.ELF starts E.ELF and exits without waiting, so
+// a foreground inferred from "most recently started" would follow to E and stay there
+// while the user sits at a prompt, with every Ctrl-C going to a background program.
+//
+// The permission rule (scheduler_set_foreground) is what stops a program taking the
+// keyboard for good. Nothing crosses the ring boundary but a number, so there is
+// nothing to bounds-check. Does not block.
+static uint64_t sys_setfg(uint64_t pgid) {
+    if (scheduler_set_foreground(scheduler_current_id(), (uint32_t)pgid) != 0) {
+        return SYSCALL_ERROR;
+    }
+    return 0;
+}
+
+// SYS_SIGNAL: install a handler for one signal on the calling task.
+//   RDI = signal number, RSI = ring-3 handler address (0 restores the default),
+//   RDX = the address of this program's sigreturn trampoline.
+// Returns 0, or SYSCALL_ERROR for a signal that cannot be caught (SIG_KILL) or an
+// address outside the ring-3 region.
+//
+// THE TRAMPOLINE COMES FROM THE PROGRAM, which looks odd until you ask where else it
+// could come from. A handler ends in `ret` and needs a return address, and that
+// address must be executable ring-3 code. Programs are separately linked ELFs at a
+// fixed 0x400000 with no kernel-owned page mapped into them, so the kernel has
+// nowhere to put one. userlib.h's wrapper supplies it and hides the argument, so a
+// program writes sys_signal(SIG_INT, handler) and never sees it.
+//
+// Does not block, so it returns through the dispatcher normally.
+static uint64_t sys_signal(uint64_t sig, uint64_t handler, uint64_t trampoline) {
+    if (signal_install_handler(scheduler_current_task(), (int)sig, handler, trampoline) != 0) {
+        return SYSCALL_ERROR;
+    }
+    return 0;
+}
+
+// SYS_SIGRETURN: resume the context interrupted when a signal handler was delivered.
+//   no args.
+// NEVER RETURNS NORMALLY, and is not a call any program should make directly: the
+// only legitimate caller is the trampoline a handler returns through. Reached at any
+// other moment it kills the caller (S7) rather than restoring a frame the program
+// built for itself.
+//
+// Writes the whole register pile itself, so it is dispatched as a bare statement and
+// never as `regs->rax = ...`: a return value written afterwards would land in the
+// restored context's RAX and corrupt the interrupted program's state.
+static void sys_sigreturn(registers_t *r) {
+    signal_sigreturn(r);
+}
+
+// SYS_KILL: raise a signal on a task by id.
+//   RDI = task id, RSI = signal number.
+// Returns 0, or SYSCALL_ERROR if there is no such live task, if it is already a
+// zombie, or if the signal is not one this kernel has.
+//
+// THIS EXISTS BECAUSE THE KEYBOARD CANNOT REACH EVERYTHING, and that is by design
+// rather than an oversight. Ctrl-C goes to the foreground group only, so a program
+// left running in another group — anything started by a parent that then exited,
+// which is exactly what `run d.elf` produces — is unreachable from the keyboard.
+// Without this call the kernel would have tasks that nothing could stop.
+//
+// The result is checked rather than assumed so `kill` can report a bad id instead of
+// silently doing nothing, which is the difference between a tool and a guess.
+// Delivery is prompt: check_signals runs at the end of this dispatch, so a signal
+// raised here takes effect without waiting for a timer tick. Does not block.
+static uint64_t sys_kill(uint64_t id, uint64_t sig) {
+    task_t *t = scheduler_task_by_id((uint32_t)id);
+    if (t == NULL || t->state == TASK_ZOMBIE) {
+        return SYSCALL_ERROR;
+    }
+    if ((int)sig <= 0 || (int)sig >= MAX_SIGS) {
+        return SYSCALL_ERROR;
+    }
+    signal_raise((uint32_t)id, (int)sig);
+    return 0;
+}
+
+// Map a kernel task state onto the number that crosses the ring boundary. The two
+// are deliberately different vocabularies (see include/taskinfo.h): this switch is
+// where a new internal state has to be considered rather than leaking out with
+// whatever value it happened to be given.
+static uint32_t task_state_for_ring3(task_state_t state) {
+    switch (state) {
+        case TASK_READY:   return TASK_INFO_READY;
+        case TASK_RUNNING: return TASK_INFO_RUNNING;
+        case TASK_BLOCKED: return TASK_INFO_BLOCKED;
+        case TASK_ZOMBIE:  return TASK_INFO_ZOMBIE;
+        default:           return 0;   // TASK_UNUSED: never published, see below
+    }
+}
+
+// SYS_TASKS: report the live tasks, one task_info_t each.
+//   RDI = buffer, RSI = size in bytes.
+// Returns the number of entries written, or SYSCALL_ERROR on a bad buffer.
+//
+// The buffer is a WRITE TARGET from ring 3, so its WHOLE span is bounds-checked
+// before a byte goes through it — the same rule as SYS_LIST's and SYS_STAT's, and
+// for the same reason. A short buffer is not an error: it is filled to capacity and
+// the count returned is what fitted, so a caller with a small array gets a truncated
+// answer rather than a failure.
+//
+// This is the kernel's first debugging tool and the first time the task table has
+// been visible from outside the kernel at all. It exists so `kill` takes a looked-up
+// id rather than a guessed one.
+static uint64_t sys_tasks(uint64_t user_buf, uint64_t bufsize) {
+    if (!user_range_ok(user_buf, bufsize)) {
+        print_string("syscall: SYS_TASKS rejected an out-of-bounds buffer\n");
+        return SYSCALL_ERROR;
+    }
+
+    uint64_t capacity = bufsize / sizeof(task_info_t);
+    task_info_t *out = (task_info_t *)user_buf;
+    uint64_t n = 0;
+
+    uint32_t limit = scheduler_task_count();
+    for (uint32_t id = 0; id < limit && n < capacity; id++) {
+        task_t *t = scheduler_task_by_id(id);
+        if (t == NULL) {
+            continue;      // a reaped task's permanent hole; ids are never reused
+        }
+        out[n].id = t->id;
+        out[n].parent_id = t->parent_id;
+        out[n].pgid = t->pgid;
+        out[n].state = task_state_for_ring3(t->state);
+        // Only a zombie has a status anybody may read. Before the exit the field is 0
+        // and means nothing, so reporting it would invite a caller to believe it.
+        out[n].exit_status = (t->state == TASK_ZOMBIE) ? t->exit_status : 0;
+        n++;
+    }
+    return n;
+}
+
 // Dispatch on the call number in RAX. Unknown numbers are reported and rejected
 // with SYSCALL_ERROR; a bad request must never fault or halt the kernel.
 void syscall_handler(registers_t *regs) {
@@ -544,7 +691,7 @@ void syscall_handler(registers_t *regs) {
             regs->rax = sys_list(regs->rdi, regs->rsi);
             break;
         case SYS_RUN:
-            regs->rax = sys_run(regs->rdi, regs->rsi, regs->rdx);
+            regs->rax = sys_run(regs->rdi, regs->rsi, regs->rdx, regs->rcx);
             break;
         case SYS_READFILE:
             regs->rax = sys_readfile(regs->rdi, regs->rsi, regs->rdx);
@@ -573,6 +720,21 @@ void syscall_handler(registers_t *regs) {
         case SYS_WAIT:
             sys_wait(regs);   // writes rax itself, and must not on the block path
             break;
+        case SYS_SETFG:
+            regs->rax = sys_setfg(regs->rdi);
+            break;
+        case SYS_SIGNAL:
+            regs->rax = sys_signal(regs->rdi, regs->rsi, regs->rdx);
+            break;
+        case SYS_KILL:
+            regs->rax = sys_kill(regs->rdi, regs->rsi);
+            break;
+        case SYS_TASKS:
+            regs->rax = sys_tasks(regs->rdi, regs->rsi);
+            break;
+        case SYS_SIGRETURN:
+            sys_sigreturn(regs);   // rewrites the whole pile; deliberately not `regs->rax = ...`
+            break;
         default:
             print_string("syscall: unknown number ");
             print_int((uint32_t)regs->rax);
@@ -580,4 +742,17 @@ void syscall_handler(registers_t *regs) {
             regs->rax = SYSCALL_ERROR;
             break;
     }
+
+    // Deliver on the way out of the syscall too, not only on the timer path. This is
+    // what makes a signal raised BY a syscall take effect immediately: SYS_KILL would
+    // otherwise set a bit and return, and the target would not notice until the next
+    // tick reached it. It is also the path that delivers to a task whose blocking
+    // syscall was just cut short by a signal (S5), which never sees a timer tick in
+    // between.
+    //
+    // Safe on every path through the switch above, including the ones that did not
+    // return here in any ordinary sense: sys_exit and the blocking calls end in
+    // schedule(), which leaves `regs` holding the INCOMING task's frame and `current`
+    // naming that task, so the two still agree and delivery goes to the right place.
+    check_signals(regs);
 }

@@ -9,4 +9,10 @@ void keyboard_init(void);
 // in drivers/keyboard.c for the empty sentinel and the full-drop policy.
 int keyboard_getchar(void);
 
+// Has Ctrl-D been pressed since the last time this was asked? Returns 1 exactly
+// once per Ctrl-D and clears the flag, so one keystroke ends one console read.
+// Called by file_read on an FD_CONSOLE (kernel/file.c), which reports it as a
+// zero-byte read — the end-of-file convention every reader already understands.
+int keyboard_console_eof(void);
+
 #endif

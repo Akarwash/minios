@@ -101,3 +101,34 @@ table (B6). Each entry gives the symptom, the cause, and the line that prevents 
   [shell.md](shell.md).
 - The decision, the EOF argument, and the failure catalogue:
   [decision 0022](../decisions/0022-file-descriptors-and-pipes.md).
+
+## SIGPIPE: writing to a pipe with no reader
+
+`pipe_write` with `readers == 0` **raises `SIG_PIPE` on the writer** and returns an
+error. It used to return only the error, which was all a kernel with no signals could
+do — and it was not enough.
+
+An error return only reaches a program that checks return values. A writer that does
+not spins against a dead buffer forever, and the only symptom is a prompt that never
+comes back. A signal reaches it regardless.
+
+`SIG_PIPE`'s default action is to kill the writer, which is what makes this
+terminate:
+
+```
+> run g.elf | run once.elf
+ONCE: read 64 bytes, exiting
+reap (wait):    task 2 exited (status 0), free frames: 30510, heap used: 5928
+reap (wait):    task 1 exited (status 141), free frames: 30585, heap used: 1192
+pipeline exited with status 0
+```
+
+141 is 128 + 13, so the writer's death is legibly `SIG_PIPE` rather than a guess.
+`ONCE.ELF` reads once and exits without draining, which is exactly the case that used
+to hang; before this, G wrote forever.
+
+**`SIG_PIPE` is catchable, deliberately.** A program that wants to handle a vanished
+reader itself installs a handler, and then the error return from the write is what it
+sees. That is why the default is kill rather than unconditional.
+
+See [signals.md](signals.md) and [decision 0023](../decisions/0023-signals.md).

@@ -209,9 +209,9 @@ it is running.
   a status (`SYS_EXIT`), and is waited on and cleaned up (`SYS_WAIT` and the
   scheduler's sweeper). What is still missing is the rest of the model: there is no
   `fork` or `exec`, so a program cannot replace its own image or duplicate itself;
-  there is no way to kill a task and there are no signals, so a program that will
-  not finish cannot be stopped; `SYS_WAIT` is any-child rather than `waitpid`; and
-  orphans are discarded rather than reparented, because there is no `init`.
+  `SYS_WAIT` is any-child rather than `waitpid`; and orphans are discarded rather
+  than reparented, because there is no `init`. **Signals now exist**, so a program
+  that will not finish can be stopped — see below.
 - **Arguments, dynamic linking, relocation, and demand paging.** A program is
   entered with an empty stack and no argv. It must be `ET_EXEC` linked at the
   fixed 0x400000, since the loader resolves and relocates nothing, so two
@@ -348,16 +348,28 @@ crash lose only unreferenced clusters, never a live file. FSInfo is invalidated
 rather than maintained. `write`/`delete`/`free` expose it from the shell. See
 [decisions/0020-writable-fat32.md](decisions/0020-writable-fat32.md).
 
+**Signals** (`kernel/signal.c`, `include/signals.h`, `user/trampoline.asm`). An
+interrupt one layer up, with no hardware behind it: a per-task pending set, delivery
+only on the way out to ring 3, default actions (kill with status 128 + signal), and
+catchable handlers reached through a hand-forged ring-3 call frame and a
+program-supplied trampoline, with `SYS_SIGRETURN` restoring the interrupted context.
+Process groups make Ctrl-C address a job rather than a task, and the foreground group
+is declared through `SYS_SETFG` rather than inferred. `SYS_KILL` and `SYS_TASKS` (with
+`ps` and `kill`) reach tasks the keyboard cannot, `SIG_PIPE` ends a writer whose
+reader has gone, and Ctrl-D gives the console an end of file. See
+[decisions/0023-signals.md](decisions/0023-signals.md) and
+[reference/signals.md](reference/signals.md).
+
 **Next.** The remaining process work the shell makes concrete: argv on the new stack
-so `run` can pass arguments, a way to kill a task so a runaway program does not
-require a reboot (`TODO(kill-and-signals)`), and `waitpid` so a parent with several
-children can name one (the pipeline shell reaches for it, working around it by
-matching the reaped child's id). Subdirectories and paths are the filesystem's own
-next rung, and a file redirect (`> OUT.TXT`) wants streaming file writes. **Pipes are
-done** ([decisions/0022-file-descriptors-and-pipes.md](decisions/0022-file-descriptors-and-pipes.md)),
+so `run` can pass arguments, and `waitpid` so a parent with several children can name
+one (the pipeline shell reaches for it, working around it by matching the reaped
+child's id). Subdirectories and paths are the filesystem's own next rung, and a file
+redirect (`> OUT.TXT`) wants streaming file writes. **Pipes are done**
+([decisions/0022-file-descriptors-and-pipes.md](decisions/0022-file-descriptors-and-pipes.md)),
 added exactly as predicted — a new pair of `wait_reason_t` and a waker in the right
-place, no change to the block/wake mechanism. Waiting on the disk is the same shape
-and still a seam.
+place, no change to the block/wake mechanism. **Signals are done too**, and were the
+last rung of phase 1 before the libc work. Waiting on the disk is the same shape as a
+pipe's block and still a seam.
 
 ## Known limitations
 
@@ -373,7 +385,7 @@ and still a seam.
   and user-accessible — which is now possible (every task has a private tree) but
   not implemented. Recorded as a TODO in `kernel/syscall.c`. See
   [reference/syscalls.md](reference/syscalls.md).
-- **Blocking is narrow, and a runaway task cannot be stopped.** Task structs
+- **Blocking is narrow, and signals are a small subset of the real thing.** Task structs
   are heap-allocated and each task now has its own address space with a private
   stack (per-process paging), so the old fixed four-task ceiling and the shared
   user-stack region are both gone: a stack overflow faults in the offending task
@@ -385,10 +397,11 @@ and still a seam.
   to be woken after a duration and a blocking call has no timeout
   (`TODO(timed-sleep)`), and wakeup is a linear scan rather than a per-reason wait
   queue. Task exit and reclamation now exist, but with sharp edges of their own:
-  **there is no way to kill a task and there are no signals**, so a program with an
-  unbounded loop leaves its parent blocked in `SYS_WAIT` with no way back short of a
-  reboot (`TODO(kill-and-signals)`); `SYS_WAIT` is any-child, so a parent cannot
-  name a particular one; orphaned zombies are discarded rather than reparented, as
+  a task can now be stopped (Ctrl-C, or `kill`), but signals are a small subset of
+  the real thing: **no per-signal masks** (one `sig_active` flag blocks everything
+  for a handler's duration), no `sigaction`, no `SIGCHLD`, no `SIGSTOP`/`SIGCONT`,
+  and no job control beyond a single foreground group; `SYS_WAIT` is any-child, so a
+  parent cannot name a particular one; orphaned zombies are discarded rather than reparented, as
   there is no `init`; and with no crt0, a program that falls off the end of `_start`
   runs into whatever bytes follow it. Memory is also still used wastefully: the
   read-only user text is copied in full per task rather than shared

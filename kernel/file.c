@@ -48,9 +48,13 @@ long file_read(file_t *f, char *buf, uint32_t len, registers_t *r) {
     if (f->kind == FD_CONSOLE) {
         // Drain up to `len` characters from the keyboard ring. If none is waiting,
         // park the task on WAIT_KEY exactly as sys_readkey does, and the keyboard IRQ
-        // wakes it when a key arrives. A CONSOLE HAS NO END OF FILE: a keyboard is
-        // never "done", so this never returns 0. Signalling console EOF would need a
-        // Ctrl-D-style key and line discipline the driver does not have (ADR 0022).
+        // wakes it when a key arrives.
+        //
+        // A CONSOLE NOW HAS AN END OF FILE, which it did not when ADR 0022 was
+        // written: Ctrl-D sets a flag in the keyboard driver and this reports it as a
+        // zero-byte read. That is the whole of the line discipline. Without it a
+        // program shaped as "read fd 0 until EOF" — COUNT.ELF is exactly that — could
+        // never finish when run on its own rather than downstream of a pipe.
         uint32_t n = 0;
         while (n < len) {
             int c = keyboard_getchar();
@@ -62,7 +66,22 @@ long file_read(file_t *f, char *buf, uint32_t len, registers_t *r) {
         if (n > 0) {
             return (long)n;
         }
-        task_block(r, WAIT_KEY);
+
+        // ORDER MATTERS: characters first, then EOF, then block. Buffered characters
+        // are delivered before the end of input is reported, so typing "abc" and then
+        // Ctrl-D gives a reader "abc" and then 0, rather than dropping the three
+        // characters that were already typed. Checking EOF before draining the ring
+        // would lose them.
+        if (keyboard_console_eof()) {
+            return 0;             // end of input: the reader's loop terminates
+        }
+
+        // Interruptible: a signal wakes this task to receive it, and the read must
+        // fail rather than park again on a keyboard that never produced a character
+        // (S5). Ctrl-C on a program blocked reading the console depends on this.
+        if (task_block(r, WAIT_KEY) == TASK_BLOCK_INTERRUPTED) {
+            return FILE_ERR;
+        }
         return FILE_BLOCKED;      // parked; the caller must not touch rax
     }
 

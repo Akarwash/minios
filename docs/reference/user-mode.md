@@ -101,7 +101,8 @@ exercised through the syscall path instead of a fault. See
   than compiled into the kernel image, and they are created, preempted, exited and
   reaped at runtime (see [scheduling.md](scheduling.md) and
   [elf-loading.md](elf-loading.md)). What is still missing is the rest of the
-  process abstraction: no `fork`, no `exec`, no signals, no way to kill a task, and
+  process abstraction: no `fork`, no `exec`, no `sigaction` (signals exist, but as a
+  small subset — see [signals.md](signals.md)), and
   no file descriptors — a program's only handle on the world is the fixed set of
   syscalls in `include/syscalls.h`.
 - **Not demand paging.** Each task has real per-process isolation: its own

@@ -212,7 +212,9 @@ in `drivers/keyboard.c` at the point where the handling would go.
 ## Ctrl and alt
 
 0x1D and 0x38 map to `0` in both tables and no state is kept for them, so ctrl+C is
-indistinguishable from C. There are no signals and no way to kill a task
+indistinguishable from C. Ctrl-C now raises `SIG_INT` on the foreground group (see
+below); what remains unmapped is every OTHER control character, since a ctrl
+combination other than C or D produces nothing at all
 ([decision 0018](../decisions/0018-process-lifecycle-exit-and-wait.md)), so there
 is nothing for a ctrl chord to mean yet.
 
@@ -225,3 +227,36 @@ is nothing for a ctrl chord to mean yet.
 - The gate the character leaves through: [syscalls.md](syscalls.md).
 - The IRQ path that gets here: [idt.md](idt.md).
 - The decision: [0019](../decisions/0019-keyboard-modifier-state-in-the-driver.md).
+
+## Ctrl, Ctrl-C and Ctrl-D
+
+Left ctrl (scancode `0x1D`) is tracked exactly as shift is — set on press, cleared on
+release — because both are states of the hardware rather than of the driver. **Right
+ctrl is not tracked**, and cannot be until extended scancodes are: it arrives as the
+two bytes `0xE0 0x1D`, the `0xE0` has bit 7 set so the release branch swallows it,
+and the `0x1D` that follows is decoded as if it were the left one. That happens to
+work, by accident. See the `TODO(extended-scancodes)` note in the driver.
+
+With ctrl held, two keys mean something:
+
+- **`c`** raises `SIG_INT` on the foreground process group.
+- **`d`** sets a `console_eof` flag rather than pushing a character.
+
+Any other key with ctrl held produces nothing at all. Falling through to the
+character path would make Ctrl-A type a plain `a`, putting a character in the buffer
+the user cannot see they typed.
+
+**Neither pushes a character, and both return before the character path's
+`scheduler_wake(WAIT_KEY)`** — exactly as the modifier presses do, and for the same
+reason. A wake with an empty ring hands every task blocked on `WAIT_KEY` a wasted
+round trip: woken, re-issue the read, find nothing, block again. Holding ctrl and
+tapping a key would turn that into a scheduler spin. (Ctrl-D's wake is *not* that
+case: there is something for a console reader to find, just not a character.)
+
+`console_eof` is the entire line discipline this kernel has. It is
+**test-and-cleared** by `keyboard_console_eof()`, so one Ctrl-D ends exactly one
+read; leaving it set would make the console report end-of-input forever. It is **one
+flag for the whole machine**, not one per descriptor, because there is one keyboard —
+with a single foreground group the task that consumes it is the one the user meant.
+
+See [signals.md](signals.md) and [decision 0023](../decisions/0023-signals.md).

@@ -3,6 +3,7 @@
 #include "../drivers/screen.h"
 #include "../drivers/ports.h"
 #include "../include/vectors.h"
+#include "signal.h"
 
 extern void isr0(void);  extern void isr1(void);  extern void isr2(void);  extern void isr3(void);
 extern void isr4(void);  extern void isr5(void);  extern void isr6(void);  extern void isr7(void);
@@ -286,4 +287,16 @@ void irq_handler(registers_t *regs) {
     if (interrupt_handlers[regs->int_no]) {
         interrupt_handlers[regs->int_no](regs);
     }
+
+    // AFTER the per-vector handler, not before, and this is the whole reason signals
+    // work during a compute loop. For the timer that handler is schedule(), which
+    // rewrites `regs` in place with the incoming task's context; running this first
+    // would examine the outgoing task against the incoming task's frame. Afterwards,
+    // `regs` and the current task agree, and this is the last thing that touches the
+    // frame before the stub pops it and returns to ring 3.
+    //
+    // check_signals itself decides whether this frame is going to ring 3 at all —
+    // nested interrupts return into kernel code, and delivering there corrupts it
+    // (S1). It is not this function's job to know.
+    check_signals(regs);
 }
