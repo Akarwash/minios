@@ -38,3 +38,21 @@ void signal_raise(uint32_t id, int sig) {
     // SET, not a queue, so holding Ctrl-C does not build a backlog of handler runs.
     t->sig_pending |= (1u << sig);
 }
+
+void signal_raise_group(uint32_t pgid, int sig) {
+    // A linear scan of the task table, like scheduler_wake's. Honest and fine at this
+    // scale; a kernel with many tasks would thread a per-group list instead.
+    //
+    // THE WHOLE GROUP IS RAISED ON, not the first match. Every stage of a pipeline
+    // gets the bit, because stopping one stage of a job and leaving the others is not
+    // what Ctrl-C means: the survivors would block forever on a pipe whose far end
+    // has gone, or keep printing at a prompt that has already come back.
+    uint32_t n = scheduler_task_count();
+    for (uint32_t id = 0; id < n; id++) {
+        task_t *t = scheduler_task_by_id(id);
+        if (t == NULL || t->pgid != pgid) {
+            continue;                 // a reaped hole, or another job
+        }
+        signal_raise(id, sig);        // re-checks the zombie case for each task
+    }
+}

@@ -63,7 +63,8 @@ void kernel_main(uint64_t multiboot_info_addr) {
         // -1, -1: a fresh console on fd 0 and fd 1. The boot task inherits no pipe
         // ends (there is no caller to inherit from), so it reads the keyboard and
         // writes the screen like any ordinary `run` with no pipeline around it.
-        if (task_create_from_file(user_programs[i], TASK_NO_PARENT, -1, -1) >= 0) {
+        if (task_create_from_file(user_programs[i], TASK_NO_PARENT, -1, -1,
+                                  TASK_PGID_INHERIT) >= 0) {
             started++;
         }
     }

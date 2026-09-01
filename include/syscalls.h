@@ -17,7 +17,7 @@
 #define SYS_WRITE    1   // RDI = fd, RSI = buffer, RDX = length; write the bytes to that descriptor, return bytes written (may be < length), or SYSCALL_ERROR
 #define SYS_READKEY  2   // no args; return one buffered key in RAX, or 0 if none
 #define SYS_LIST     3   // RDI = buffer, RSI = size; list root dir names, return count
-#define SYS_RUN      4   // RDI = filename ptr, RSI = in_fd, RDX = out_fd (-1 for a fresh console); load and start it, giving it those descriptors as fd 0/1; return the child's task id, or SYSCALL_ERROR
+#define SYS_RUN      4   // RDI = filename ptr, RSI = in_fd, RDX = out_fd (-1 for a fresh console), RCX = process group request (0 inherit, -1 new group, else join that group); load and start it, giving it those descriptors as fd 0/1; return the child's task id, or SYSCALL_ERROR
 #define SYS_READFILE 5   // RDI = filename ptr, RSI = buffer, RDX = size; return bytes read
 #define SYS_WAIT     6   // RDI = uint64_t *out_id or 0; block until any child exits; RAX = that child's exit status, or SYSCALL_ERROR if the caller has no children; writes the exited child's id through out_id when it is nonzero
 #define SYS_WRITEFILE 7  // RDI = filename ptr, RSI = buffer, RDX = length; 0 on success, SYSCALL_ERROR on failure
@@ -27,5 +27,6 @@
 #define SYS_READ     11  // RDI = fd, RSI = buffer, RDX = length; read up to length bytes, return the count, 0 at EOF, SYSCALL_ERROR on a bad fd. Blocks on an empty pipe/console.
 #define SYS_CLOSE    12  // RDI = fd; close the descriptor, return 0, or SYSCALL_ERROR on a bad fd. Does not block.
 #define SYS_PIPE     13  // RDI = int[2] out; make a pipe, write [read_fd, write_fd], return 0 or SYSCALL_ERROR. Does not block.
+#define SYS_SETFG    17  // RDI = pgid; make that process group the foreground, the one Ctrl-C is addressed to. 0 or SYSCALL_ERROR. Does not block.
 
 #endif

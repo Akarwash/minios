@@ -9,6 +9,7 @@
 #include "../fs/fat32.h"
 #include "../libc/mem.h"
 #include "../include/syscalls.h"
+#include "signal.h"
 
 // The most bytes one SYS_READ or SYS_WRITE moves in a single call. A counted
 // buffer from ring 3 is copied through a kernel staging buffer of this size, so a
@@ -325,7 +326,19 @@ static uint64_t sys_list(uint64_t user_buf, uint64_t bufsize) {
 // child, since nothing can inject one into a running task, so a pipeline hands the
 // pipe ends across here at creation. task_create_from_file validates and inherits
 // them (in_fd must be a read end, out_fd a write end).
-static uint64_t sys_run(uint64_t user_name, uint64_t in_fd, uint64_t out_fd) {
+//
+// RCX = the process group the child joins: 0 to inherit the caller's (the old
+// behaviour, and what a program that has never heard of groups gets), TASK_PGID_NEW
+// for a new group led by the child, or an existing group to join. A FOURTH REGISTER
+// RATHER THAN AN OVERLOADED EXISTING ONE: the three arguments already here keep
+// exactly their old meanings and their old values, so every existing call site means
+// what it always did and 0 is the old behaviour. RCX (not R10) because this kernel
+// enters through `int 0x50`, which unlike the `syscall` instruction does not clobber
+// RCX, so the fourth argument can sit where the System V C ABI already puts it.
+// task_create_from_file rejects a group the caller may not join, and the create fails
+// rather than quietly inheriting.
+static uint64_t sys_run(uint64_t user_name, uint64_t in_fd, uint64_t out_fd,
+                       uint64_t pgid_req) {
     char name[SYSCALL_NAME_MAX];
     if (copy_user_string(user_name, name, sizeof(name)) != 0) {
         print_string("syscall: SYS_RUN rejected a bad filename pointer\n");
@@ -335,7 +348,8 @@ static uint64_t sys_run(uint64_t user_name, uint64_t in_fd, uint64_t out_fd) {
     // for the program it started. The id has to be taken HERE, inside the syscall,
     // because `current` is only the requesting task while its own syscall is being
     // served; by the next timer tick it means somebody else.
-    int id = task_create_from_file(name, scheduler_current_id(), (int)in_fd, (int)out_fd);
+    int id = task_create_from_file(name, scheduler_current_id(), (int)in_fd, (int)out_fd,
+                                   (uint32_t)pgid_req);
     if (id < 0) {
         // REPORT THE FREE FRAME COUNT, not just the failure. A create can fail after
         // it has already built a page-table tree and mapped part of a program into
@@ -527,6 +541,26 @@ static void sys_wait(registers_t *regs) {
     task_wait(regs);
 }
 
+// SYS_SETFG: declare which process group is in the foreground — the one the
+// keyboard's Ctrl-C is addressed to.
+//   RDI = pgid.
+// Returns 0, or SYSCALL_ERROR if the caller is not allowed to name that group.
+//
+// FOREGROUND IS DECLARED, NOT INFERRED, and this call is the whole of the interface.
+// It cannot be derived from SYS_RUN: D.ELF starts E.ELF and exits without waiting, so
+// a foreground inferred from "most recently started" would follow to E and stay there
+// while the user sits at a prompt, with every Ctrl-C going to a background program.
+//
+// The permission rule (scheduler_set_foreground) is what stops a program taking the
+// keyboard for good. Nothing crosses the ring boundary but a number, so there is
+// nothing to bounds-check. Does not block.
+static uint64_t sys_setfg(uint64_t pgid) {
+    if (scheduler_set_foreground(scheduler_current_id(), (uint32_t)pgid) != 0) {
+        return SYSCALL_ERROR;
+    }
+    return 0;
+}
+
 // Dispatch on the call number in RAX. Unknown numbers are reported and rejected
 // with SYSCALL_ERROR; a bad request must never fault or halt the kernel.
 void syscall_handler(registers_t *regs) {
@@ -544,7 +578,7 @@ void syscall_handler(registers_t *regs) {
             regs->rax = sys_list(regs->rdi, regs->rsi);
             break;
         case SYS_RUN:
-            regs->rax = sys_run(regs->rdi, regs->rsi, regs->rdx);
+            regs->rax = sys_run(regs->rdi, regs->rsi, regs->rdx, regs->rcx);
             break;
         case SYS_READFILE:
             regs->rax = sys_readfile(regs->rdi, regs->rsi, regs->rdx);
@@ -572,6 +606,9 @@ void syscall_handler(registers_t *regs) {
             break;
         case SYS_WAIT:
             sys_wait(regs);   // writes rax itself, and must not on the block path
+            break;
+        case SYS_SETFG:
+            regs->rax = sys_setfg(regs->rdi);
             break;
         default:
             print_string("syscall: unknown number ");

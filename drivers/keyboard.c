@@ -252,12 +252,12 @@ static void keyboard_callback(registers_t *regs) {
     // tapping c would spin the scheduler doing that.
     if (ctrl_held) {
         if (scancode == KEY_C) {
-            // Ctrl-C: interrupt. Which task this reaches is the interesting question
-            // and it is answered in the next stage, where process groups and a
-            // declared foreground arrive; until then it goes to whichever task the
-            // keyboard IRQ interrupted, which is enough to prove the key is decoded
-            // and the bit is set, and is not yet the right answer.
-            signal_raise(scheduler_current_id(), SIG_INT);
+            // Ctrl-C: interrupt the FOREGROUND GROUP — the job the person is
+            // looking at — and not the running task. The task the keyboard IRQ
+            // happens to interrupt is whatever the round-robin reached, which on a
+            // machine running a background program is routinely not the job the user
+            // means. A job is a group precisely so this key can name it.
+            signal_raise_group(scheduler_foreground_pgid(), SIG_INT);
             return;
         }
         if (scancode == KEY_D) {

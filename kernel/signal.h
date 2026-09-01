@@ -26,4 +26,13 @@
 // it never switches tasks and never touches a register pile.
 void signal_raise(uint32_t id, int sig);
 
+// Raise `sig` on EVERY live task in process group `pgid`. This is what the keyboard
+// uses: Ctrl-C is addressed to a job, and a job is a group, because a three-stage
+// pipeline is three tasks and one thing to the person who typed it. Interrupting
+// only one of them would leave the other two running against a dead neighbour.
+//
+// Raising on a group that contains nothing is a silent no-op, which is the right
+// answer for a job whose stages have all already exited.
+void signal_raise_group(uint32_t pgid, int sig);
+
 #endif

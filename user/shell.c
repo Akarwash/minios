@@ -263,12 +263,24 @@ static void cmd_delete(char *name) {
     }
 }
 
+// The shell's own process group. The shell is task 0 and a group is named after its
+// leader, so the shell's group is 0 — the value the foreground starts at, and the
+// value it must be restored to every time a job ends.
+//
+// Named rather than written as a bare 0 at the two call sites, because `sys_setfg(0)`
+// reads as "clear the foreground" and it is not: it is "the shell is in front again".
+#define SHELL_PGID  0UL
+
 static void cmd_run(char *name) {
     if (name == (char *)0) {
         sys_print("run: missing filename\n");
         return;
     }
-    if (sys_run(name, -1, -1) == SYS_FAIL) {   // -1/-1: a plain run, fresh console, no pipe
+    // A JOB OF ITS OWN. Even a single program gets a new process group, so Ctrl-C
+    // while it runs is addressed to it and not to this shell. The returned task id is
+    // that group's id, because a group is named after the task that leads it.
+    unsigned long id = sys_run_group(name, -1, -1, SYS_RUN_GROUP_NEW);
+    if (id == SYS_FAIL) {   // -1/-1: a plain run, fresh console, no pipe
         sys_print("run: could not start ");
         sys_print(name);
         sys_print("\n");
@@ -289,7 +301,11 @@ static void cmd_run(char *name) {
     // so if the program never calls sys_exit, this shell blocks here forever and the
     // only way back is a reboot. That is why every program in user/ has a bounded
     // loop.
+    // Hand the keyboard to the job, wait for it, and take it back. sys_setfg is the
+    // declaration that this group is what Ctrl-C means from here until the job ends.
+    sys_setfg(id);
     long status = sys_wait();
+    sys_setfg(SHELL_PGID);   // unconditional: see the note on SHELL_PGID
 
     // Any real status is 0..255 (the kernel masks it), so a negative return is the
     // error case and cannot be confused with a program that exited 255. It means the
@@ -386,7 +402,7 @@ static int line_has_pipe(const char *s) {
 // they cannot be a stage. `in_fd`/`out_fd` are the descriptors the child gets as its
 // fd 0 and fd 1 (-1 for a fresh console). Returns the child's task id (>= 1), or -1
 // on a parse error or a launch failure. `seg` is tokenized in place.
-static long start_segment(char *seg, int in_fd, int out_fd) {
+static long start_segment(char *seg, int in_fd, int out_fd, unsigned long pgid) {
     char *pos = seg;
     char *cmd = next_token(&pos, ' ');
     if (cmd == (char *)0 || !str_eq(cmd, "run")) {
@@ -398,7 +414,7 @@ static long start_segment(char *seg, int in_fd, int out_fd) {
         sys_print("pipe: run needs a filename\n");
         return -1;
     }
-    unsigned long ret = sys_run(name, in_fd, out_fd);
+    unsigned long ret = sys_run_group(name, in_fd, out_fd, pgid);
     if (ret == SYS_FAIL) {
         sys_print("pipe: could not start ");
         sys_print(name);
@@ -438,6 +454,7 @@ static void run_pipeline(void) {
     int in_fd = -1;         // the read end the current stage inherits (from the last pipe)
     long last_id = -1;      // task id of the last stage, whose status is the pipeline's
     int started = 0;        // how many stages actually launched (so we wait for exactly that many)
+    unsigned long job_pgid = 0;   // the job's group; 0 until the first stage leads one
 
     for (int i = 0; i < n; i++) {
         int out_fd = -1;
@@ -455,7 +472,12 @@ static void run_pipeline(void) {
             next_in = p[0];
         }
 
-        long id = start_segment(seg[i], in_fd, out_fd);
+        // EVERY STAGE OF A PIPELINE IS IN ONE GROUP. The first stage asks for a new
+        // group and leads it; the rest join the id it was given. That is what makes
+        // Ctrl-C reach all three stages of `run a | run b | run c` — they are three
+        // tasks and one job, and the group is the only thing that says so.
+        long id = start_segment(seg[i], in_fd, out_fd,
+                                (job_pgid == 0) ? SYS_RUN_GROUP_NEW : job_pgid);
 
         // THESE TWO CLOSES ARE LOAD-BEARING (B1). The shell created the pipe, so it
         // holds BOTH ends; once the child has its copies the shell must drop its own,
@@ -483,6 +505,9 @@ static void run_pipeline(void) {
             goto drain;
         }
 
+        if (job_pgid == 0) {
+            job_pgid = (unsigned long)id;   // the first stage leads, and names, the group
+        }
         if (i == n - 1) {
             last_id = id;               // the last stage's status is the pipeline's
         }
@@ -490,6 +515,13 @@ static void run_pipeline(void) {
     }
 
 drain:
+    // Give the keyboard to the job before waiting for it, so Ctrl-C reaches the
+    // pipeline rather than this shell. If no stage started there is no group to hand
+    // it to, and the shell simply keeps it.
+    if (job_pgid != 0) {
+        sys_setfg(job_pgid);
+    }
+
     // Reap every stage that started, so no zombie is left behind, and keep the status
     // of the one whose id matches the last stage.
     {
@@ -507,6 +539,14 @@ drain:
             sys_print("\n");
         }
     }
+
+    // TAKE THE KEYBOARD BACK, UNCONDITIONALLY. This runs whether the pipeline
+    // succeeded, failed to start, or was killed by the Ctrl-C that was addressed to
+    // it — every path through this function reaches here, including the `goto drain`
+    // ones. A shell that only restores the foreground on success loses the keyboard
+    // the first time anything goes wrong, and there is nothing that could give it
+    // back: the group it handed control to is gone, so no key can reach anything.
+    sys_setfg(SHELL_PGID);
 }
 
 // The entry point named by user.ld's ENTRY(_start). The loader takes the entry

@@ -125,6 +125,19 @@ typedef struct task {
     // the caller has no children at all.
     int32_t exit_status;
 
+    // This task's PROCESS GROUP: the unit Ctrl-C acts on, rather than the single
+    // task. A pipeline is several tasks that are one job to the person who typed it,
+    // and interrupting the job has to reach all of them, so the group is what a
+    // signal from the keyboard is addressed to.
+    //
+    // Inherited from the parent unless SYS_RUN is asked for something else, so a
+    // program that knows nothing about groups is simply in its parent's. Task 0 (the
+    // shell) is in group 0. A group created by SYS_RUN_GROUP_NEW is NAMED AFTER ITS
+    // LEADER — the pgid is the leading task's own id — which is the Unix convention
+    // and, more usefully here, guarantees uniqueness for free: task ids are never
+    // reused, so a group id can never collide with a live group.
+    uint32_t pgid;
+
     // The set of signals raised on this task and not yet delivered, one bit per
     // signal number (see include/signals.h). A SET, NOT A QUEUE: raising SIG_INT
     // twice before either is delivered leaves one bit and produces one delivery,
@@ -171,7 +184,26 @@ typedef struct task {
 // bad. A failed load creates no task, leaks nothing (any inherited-end count it took
 // is undone), and must not disturb the ones that succeeded. Implemented in
 // scheduler.c.
-int task_create_from_file(const char *name, uint32_t parent_id, int in_fd, int out_fd);
+//
+// `pgid_req` says which process group the child joins:
+//   TASK_PGID_INHERIT (0)  the parent's group, which is what a caller that knows
+//                          nothing about groups gets, and the old behaviour.
+//   TASK_PGID_NEW          a new group led by this child, so pgid == its own id.
+//   anything else          that existing group, permitted only under the same rule
+//                          scheduler_set_foreground enforces (the caller's own
+//                          group, or a group one of its children is already in).
+//                          This is how a shell puts every stage of a pipeline into
+//                          the one group: the first stage leads it, the rest join.
+// A request the caller is not allowed to make fails the create rather than silently
+// falling back to inheritance, so a shell cannot half-build a job group and not know.
+int task_create_from_file(const char *name, uint32_t parent_id, int in_fd, int out_fd,
+                          uint32_t pgid_req);
+
+// The two special values of task_create_from_file's `pgid_req`. 0 is safe as
+// "inherit" because group 0 is task 0's own group and no other task can ever lead
+// it: pgids name their leader, and task 0 is the only task with id 0.
+#define TASK_PGID_INHERIT  0u
+#define TASK_PGID_NEW      0xFFFFFFFFu
 
 // Pick task 0 and enter it. Does not return (control only ever comes back into
 // the kernel through an interrupt, where schedule() runs).
@@ -238,6 +270,32 @@ void task_wait(registers_t *r);
 // who made a request (SYS_RUN stamps the new task's parent_id with it) without
 // scheduler.c having to export the whole task table.
 uint32_t scheduler_current_id(void);
+
+// The foreground process group: the one the keyboard's Ctrl-C is addressed to.
+// Group 0, the shell's, at boot.
+//
+// DECLARED, NOT INFERRED. It is not "the group of the task most recently started",
+// and D.ELF is the proof that it cannot be: D starts E and exits without waiting, so
+// an inferred foreground would follow to E and stay there while the user sits at a
+// prompt, with Ctrl-C reaching a background program and never the shell. A task says
+// which group is in front, and says it again when it stops being true. See
+// scheduler_set_foreground and docs/decisions/0023-signals.md.
+uint32_t scheduler_foreground_pgid(void);
+
+// Make `pgid` the foreground group. Returns 0 on success, -1 if `caller_id` is not
+// allowed to ask for it.
+//
+// THE PERMISSION RULE IS THE WHOLE POINT of this being a function rather than an
+// assignment: a task may name only its OWN group, or a group held by at least one of
+// its own children. Without that rule any program could take the keyboard and never
+// give it back, and nothing could take it away again.
+int scheduler_set_foreground(uint32_t caller_id, uint32_t pgid);
+
+// How many task slots have ever been filled: the bound for a scan over the table.
+// A HIGH-WATER MARK, NOT A LIVE COUNT — ids are never reused and reaped tasks leave
+// permanent NULL holes, so every caller pairs this with a NULL check. Exposed for
+// kernel/signal.c, which has to walk the table to find a whole process group.
+uint32_t scheduler_task_count(void);
 
 // The live task with this id, or NULL if the id is out of range or names a slot
 // that has been reaped. Exposed so kernel/signal.c can raise a signal on a task
