@@ -27,6 +27,9 @@
 #define SYS_READ     11  // RDI = fd, RSI = buffer, RDX = length; read up to length bytes, return the count, 0 at EOF, SYSCALL_ERROR on a bad fd. Blocks on an empty pipe/console.
 #define SYS_CLOSE    12  // RDI = fd; close the descriptor, return 0, or SYSCALL_ERROR on a bad fd. Does not block.
 #define SYS_PIPE     13  // RDI = int[2] out; make a pipe, write [read_fd, write_fd], return 0 or SYSCALL_ERROR. Does not block.
+#define SYS_SIGNAL   14  // RDI = signal, RSI = ring-3 handler address (0 to restore the default), RDX = trampoline address; install a handler for this task. 0 or SYSCALL_ERROR. Does not block.
+#define SYS_KILL     15  // RDI = task id, RSI = signal; raise that signal on that task. 0 or SYSCALL_ERROR. Does not block.
+#define SYS_SIGRETURN 16 // no args; restore the context saved when a handler was delivered. NEVER RETURNS NORMALLY: the frame it restores resumes the interrupted instruction. Only the trampoline calls it.
 #define SYS_SETFG    17  // RDI = pgid; make that process group the foreground, the one Ctrl-C is addressed to. 0 or SYSCALL_ERROR. Does not block.
 
 #endif

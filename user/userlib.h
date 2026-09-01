@@ -328,6 +328,46 @@ unsigned long sys_stat(const char *name, unsigned long *out_size) {
     return syscall2(SYS_STAT, (unsigned long)name, (unsigned long)out_size);
 }
 
+// The trampoline a signal handler returns through, defined in user/trampoline.asm
+// and linked into every program. A program never calls it; its address is what
+// sys_signal hands the kernel, and the kernel writes it as the handler's return
+// address when it forges the call frame.
+extern void sigreturn_trampoline(void);
+
+// SYS_SIGNAL: install `handler` for `sig` on this program. Pass 0 to restore the
+// default action, which is to be killed with status 128 + sig.
+//
+// The handler is called with the signal number as its argument, on this program's
+// own stack, with everything the signal interrupted saved underneath. Returning from
+// it normally resumes the interrupted code exactly where it was, which is what makes
+// a handled Ctrl-C a pause rather than an end.
+//
+// SIG_KILL CANNOT BE HANDLED and this returns -1 for it. A signal a program can
+// catch is a request; there has to be one that is not, or a program could refuse to
+// die.
+//
+// The trampoline address is the third argument on the wire and is supplied here, so
+// callers never see it. It has to come from the program because there is no
+// kernel-owned page mapped into a program's address space for the kernel to point a
+// return address at. Returns 0, or (unsigned long)-1.
+static inline __attribute__((always_inline))
+unsigned long sys_signal(int sig, void (*handler)(int)) {
+    return syscall3(SYS_SIGNAL, (unsigned long)sig, (unsigned long)handler,
+                    (unsigned long)&sigreturn_trampoline);
+}
+
+// SYS_KILL: raise `sig` on the task with id `id`. Returns 0, or (unsigned long)-1 if
+// there is no such live task or the signal is not one this kernel has.
+//
+// This is how a task the keyboard cannot reach is stopped: Ctrl-C goes to the
+// foreground group only, so a program left running in another group — anything
+// started by a parent that then exited — is unreachable from the keyboard by design.
+// Pair it with sys_tasks, so the id is looked up rather than guessed.
+static inline __attribute__((always_inline))
+unsigned long sys_kill(unsigned long id, int sig) {
+    return syscall2(SYS_KILL, id, (unsigned long)sig);
+}
+
 // A crude busy-wait so the letters do not scroll past faster than the eye can
 // follow. This is NOT a timed delay, just a spin; the count was tuned by eye
 // under QEMU for a readable interleave. A real system would sleep, not spin.

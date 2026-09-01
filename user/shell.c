@@ -45,6 +45,13 @@
 // Static (in .bss, inside the ring-3 region), not on the stack: the file buffer is
 // large, and keeping these off the 256KB user stack leaves it for call frames.
 static char line[SHELL_LINE_MAX];
+
+// Set by the handler, read and cleared by read_line. A handler cannot reach
+// read_line's local length counter, and abandoning the half-typed line is most of
+// what "Ctrl-C at a prompt" MEANS: without this the fresh prompt is cosmetic, the
+// characters already typed are still in the buffer, and the next thing the user
+// types is appended to them. Volatile because nothing the compiler can see writes it.
+static volatile int line_abandoned;
 static char list_buf[SHELL_LIST_MAX];
 static char file_buf[SHELL_FILE_MAX];
 
@@ -354,7 +361,31 @@ static void read_line(void) {
         // per keystroke and the shell costs nothing while the user is thinking. It
         // used to spin here, calling a non-blocking read over and over and burning
         // every slice it was given; the kernel now sleeps the task instead.
-        char c = (char)sys_readkey();
+        unsigned long key = sys_readkey();
+
+        // A SIGNAL CUTS THIS CALL SHORT, and that is a real answer, not a key. When a
+        // signal is raised on a task blocked in a syscall the kernel wakes it,
+        // fails the call with SYS_FAIL, and delivers the handler on the way out
+        // (decision 9 of the signals rung) — precisely so the call cannot silently
+        // re-issue and swallow the signal. From here that looks like sys_readkey
+        // returning -1, and treating it as a character appends 0xFF to the line: the
+        // symptom is a Ctrl-C at the prompt leaving invisible junk in the buffer, so
+        // the next command typed is rejected as unknown for no visible reason.
+        //
+        // The handler has already run by the time this returns. Nothing is owed here
+        // but to wait for a real key.
+        if (key == SYS_FAIL) {
+            continue;
+        }
+
+        // The handler ran, so throw away whatever had been typed. Checked here rather
+        // than in the handler because the count lives in this frame; the handler can
+        // only raise the flag.
+        if (line_abandoned) {
+            line_abandoned = 0;
+            len = 0;
+        }
+        char c = (char)key;
 
         if (c == '\n') {
             sys_print("\n");   // echo the newline that ends the line
@@ -551,8 +582,36 @@ drain:
 
 // The entry point named by user.ld's ENTRY(_start). The loader takes the entry
 // address from the ELF header, so this symbol only has to match the linker script.
+// The shell's own SIG_INT handler, and the reason it exists is defensive rather
+// than featureful.
+//
+// Ctrl-C is addressed to the foreground group, and the shell hands that over to
+// every job it starts and takes it back afterwards, so in the ordinary case Ctrl-C
+// never reaches here at all. But "the ordinary case" is doing a lot of work in that
+// sentence: at an idle prompt the foreground IS the shell's group, and if a
+// sys_setfg ever failed, or a future edit forgot one, Ctrl-C would arrive here too.
+//
+// Without a handler the default action applies and the shell — task 0 — is killed.
+// Nothing waits on task 0, so there is not even a reap line; the machine simply
+// stops responding, with no shell and no way to start one. That is the whole failure
+// mode, and it is why this is not optional politeness.
+//
+// So the shell does what every real shell does with an interrupt at a prompt:
+// abandon the line and give a fresh one. The prompt is printed here rather than left
+// to the main loop because the loop is blocked inside read_line when this runs, and
+// will resume there rather than at the top.
+static void on_interrupt(int sig) {
+    (void)sig;
+    line_abandoned = 1;
+    sys_print("\n> ");
+}
+
 void _start(void) {
     sys_print("TownOS shell. type 'help'.\n");
+
+    // Install it before the first prompt, so there is no window in which a Ctrl-C
+    // would find the shell defenceless.
+    sys_signal(SIG_INT, on_interrupt);
 
     for (;;) {
         sys_print("> ");

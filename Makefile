@@ -92,12 +92,24 @@ USER_LDFLAGS = -T $(USER_LD_SCRIPT) -Wl,-z,max-page-size=4096 -Wl,--build-id=non
 # the kernel works and would be pointless on a machine anybody used. They build
 # identically and land on the same disk; the split is about what a reader should
 # conclude when one of them looks strange. See user/tests/README.md.
+# Every user program is linked against the signal trampoline, the two
+# instructions a signal handler "returns" through on its way back into the
+# kernel. It has to live in the PROGRAM's address space: a program is a
+# separately linked ELF at a fixed 0x400000 with no kernel page mapped into it,
+# so there is nowhere kernel-side that ring-3 code could execute. See
+# user/trampoline.asm and docs/reference/signals.md.
+USER_TRAMPOLINE_SRC = user/trampoline.asm
+USER_TRAMPOLINE_OBJ = user/trampoline.o
+
+$(USER_TRAMPOLINE_OBJ): $(USER_TRAMPOLINE_SRC)
+	$(ASM) $(ASMFLAGS) $< -o $@
+
 USER_PROGRAMS = user/tests/A.ELF user/tests/B.ELF user/tests/C.ELF \
                 user/tests/D.ELF user/tests/E.ELF user/tests/F.ELF user/tests/G.ELF \
-                user/tests/COUNT.ELF user/tests/UPPER.ELF user/SHELL.ELF
+                user/tests/COUNT.ELF user/tests/UPPER.ELF user/tests/H.ELF user/SHELL.ELF
 
-user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h
-	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $<
+user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h $(USER_TRAMPOLINE_OBJ)
+	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
 
 # The kernel test fixtures. Same recipe; a separate rule because the source lives a
 # directory down and the prerequisite path has to say so.
@@ -106,13 +118,13 @@ user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include
 # stem "tests/X"). Make resolves that by preferring the shorter stem, so this rule
 # wins, which is what we want: it is the one whose prerequisites name the right
 # source file.
-user/tests/%.ELF: user/tests/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h
-	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $<
+user/tests/%.ELF: user/tests/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h $(USER_TRAMPOLINE_OBJ)
+	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
 
 # The interactive shell. Same recipe as the pattern rule, but the target and source
 # names differ in case, so it is spelled out explicitly and portably.
-user/SHELL.ELF: user/shell.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h
-	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $<
+user/SHELL.ELF: user/shell.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h $(USER_TRAMPOLINE_OBJ)
+	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
 
 # Default target
 all: townos.bin $(USER_PROGRAMS)
@@ -246,5 +258,5 @@ run: townos.bin disk-programs disk-testfiles
 # `make run` writes it again. The COPY of it already on the disk image stays, along
 # with everything else there, because the image is not build output.
 clean:
-	rm -f $(ALL_OBJECTS) townos.bin townos.elf $(USER_PROGRAMS) $(DISK_TESTFILES)
+	rm -f $(ALL_OBJECTS) townos.bin townos.elf $(USER_PROGRAMS) $(DISK_TESTFILES) $(USER_TRAMPOLINE_OBJ)
 	rm -f user/A.ELF user/B.ELF user/C.ELF user/user_program.o

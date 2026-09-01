@@ -4,6 +4,11 @@
 #include "isr.h"                  // registers_t
 #include "../include/types.h"
 #include "../include/signals.h"   // SIG_INT and friends, shared with ring 3
+#include "scheduler.h"            // task_t, which the handler-install call names
+
+// scheduler.h does not include this header, so the pair does not cycle. The
+// dependency runs one way on purpose: the scheduler owns the task struct and knows
+// nothing about signals; signals are a thing done TO a task.
 
 // ============================================================================
 // Raising and delivering signals.
@@ -49,5 +54,18 @@ void signal_raise_group(uint32_t pgid, int sig);
 // out, which for a killed task never comes and for a handled one is after the
 // handler returns.
 void check_signals(registers_t *r);
+
+// Install `handler` (a ring-3 address, or 0 to restore the default action) for
+// `sig` on task `t`, recording `trampoline` as the address a delivered handler
+// returns through. Returns 0, or -1 for a signal that cannot be handled, or an
+// address outside the ring-3 region. Backs SYS_SIGNAL.
+int signal_install_handler(task_t *t, int sig, uint64_t handler, uint64_t trampoline);
+
+// Restore the context saved when a handler was delivered, into the live frame `r`.
+// Backs SYS_SIGRETURN, and is reachable only from the trampoline a handler returns
+// through. DOES NOT RETURN NORMALLY in any useful sense: on success `r` now holds
+// the interrupted context, so the stub's iretq resumes the program where the signal
+// found it, not after this call. On abuse it kills the task instead.
+void signal_sigreturn(registers_t *r);
 
 #endif

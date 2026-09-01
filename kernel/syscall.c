@@ -26,21 +26,8 @@ static char io_staging[SYSCALL_IO_MAX];
 // The cap is what stops an unterminated user string from walking off the region.
 #define SYSCALL_NAME_MAX 16
 
-// Is the whole range [ptr, ptr + len) inside the single ring-3 region? This is the
-// security boundary for every syscall that is handed a buffer to write into or a
-// string to read out of. The pointer comes from ring 3 and is UNTRUSTED, so it is
-// checked BEFORE the kernel touches a byte through it (same spirit as the ELF
-// loader's segment bounds check in kernel/elf.c). Unlike the SYS_WRITE stopgap
-// below, this bounds the ENTIRE range, not just the start, and it is careful about
-// overflow: ptr + len can wrap on a crafted length, and a wrapped sum compares as
-// comfortably small, so len is checked against the room above ptr rather than by
-// forming ptr + len.
-static int user_range_ok(uint64_t ptr, uint64_t len) {
-    if (ptr < USER_REGION_START || ptr >= USER_REGION_END) {
-        return 0;
-    }
-    return len <= USER_REGION_END - ptr;
-}
+// user_range_ok moved to kernel/memory.h, beside the region constants it tests,
+// so kernel/signal.c can apply the identical check to a signal frame's destination.
 
 // Copy a NUL-terminated string from ring 3 into a kernel buffer, capping the
 // length so a missing terminator cannot walk out of the region. The start pointer
@@ -569,6 +556,41 @@ static uint64_t sys_setfg(uint64_t pgid) {
     return 0;
 }
 
+// SYS_SIGNAL: install a handler for one signal on the calling task.
+//   RDI = signal number, RSI = ring-3 handler address (0 restores the default),
+//   RDX = the address of this program's sigreturn trampoline.
+// Returns 0, or SYSCALL_ERROR for a signal that cannot be caught (SIG_KILL) or an
+// address outside the ring-3 region.
+//
+// THE TRAMPOLINE COMES FROM THE PROGRAM, which looks odd until you ask where else it
+// could come from. A handler ends in `ret` and needs a return address, and that
+// address must be executable ring-3 code. Programs are separately linked ELFs at a
+// fixed 0x400000 with no kernel-owned page mapped into them, so the kernel has
+// nowhere to put one. userlib.h's wrapper supplies it and hides the argument, so a
+// program writes sys_signal(SIG_INT, handler) and never sees it.
+//
+// Does not block, so it returns through the dispatcher normally.
+static uint64_t sys_signal(uint64_t sig, uint64_t handler, uint64_t trampoline) {
+    if (signal_install_handler(scheduler_current_task(), (int)sig, handler, trampoline) != 0) {
+        return SYSCALL_ERROR;
+    }
+    return 0;
+}
+
+// SYS_SIGRETURN: resume the context interrupted when a signal handler was delivered.
+//   no args.
+// NEVER RETURNS NORMALLY, and is not a call any program should make directly: the
+// only legitimate caller is the trampoline a handler returns through. Reached at any
+// other moment it kills the caller (S7) rather than restoring a frame the program
+// built for itself.
+//
+// Writes the whole register pile itself, so it is dispatched as a bare statement and
+// never as `regs->rax = ...`: a return value written afterwards would land in the
+// restored context's RAX and corrupt the interrupted program's state.
+static void sys_sigreturn(registers_t *r) {
+    signal_sigreturn(r);
+}
+
 // Dispatch on the call number in RAX. Unknown numbers are reported and rejected
 // with SYSCALL_ERROR; a bad request must never fault or halt the kernel.
 void syscall_handler(registers_t *regs) {
@@ -617,6 +639,12 @@ void syscall_handler(registers_t *regs) {
             break;
         case SYS_SETFG:
             regs->rax = sys_setfg(regs->rdi);
+            break;
+        case SYS_SIGNAL:
+            regs->rax = sys_signal(regs->rdi, regs->rsi, regs->rdx);
+            break;
+        case SYS_SIGRETURN:
+            sys_sigreturn(regs);   // rewrites the whole pile; deliberately not `regs->rax = ...`
             break;
         default:
             print_string("syscall: unknown number ");

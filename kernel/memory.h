@@ -14,6 +14,25 @@
 #define USER_REGION_START  0x400000         // 4 MB, ring-3 code (PD[2])
 #define USER_REGION_END    0x800000         // 8 MB, top of ring-3 stack (PD[3])
 
+// Is the whole range [ptr, ptr + len) inside the single ring-3 region? THE
+// security boundary for every kernel path handed a pointer that came from ring 3,
+// whether to read a string out of it or to write a buffer through it. It bounds the
+// ENTIRE range rather than just the start, and it is careful about overflow: ptr +
+// len can wrap on a crafted length and a wrapped sum compares as comfortably small,
+// so len is checked against the room above ptr rather than by forming ptr + len.
+//
+// It lives here, beside the two constants it tests against, rather than in the
+// syscall layer that used to own it, because kernel/signal.c needs the same check
+// on the same region: signal delivery writes a whole register frame through a stack
+// pointer that came from ring 3 (S4 in docs/decisions/0023-signals.md). Two
+// spellings of one security check is how one of them ends up subtly weaker.
+static inline int user_range_ok(uint64_t ptr, uint64_t len) {
+    if (ptr < USER_REGION_START || ptr >= USER_REGION_END) {
+        return 0;
+    }
+    return len <= USER_REGION_END - ptr;
+}
+
 // Read the Multiboot memory map, extend the identity map to cover real RAM (up
 // to a 1GB ceiling), and flush the TLB. Returns the detected top-of-RAM in bytes
 // (uncapped, for reporting); 0 means no map was provided and the safe fixed

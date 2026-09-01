@@ -1,5 +1,10 @@
 #include "signal.h"
 #include "scheduler.h"
+#include "syscall.h"      // SYSCALL_ERROR
+#include "memory.h"       // user_range_ok, the ring-3 region bound
+#include "gdt.h"          // the ring-3 selectors sigreturn forces
+#include "usermode.h"     // USER_MODE_RFLAGS, for the IF bit sigreturn forces
+#include "../libc/mem.h"  // memcpy
 
 // ============================================================================
 // The raising half of signals.
@@ -79,6 +84,88 @@ void signal_raise_group(uint32_t pgid, int sig) {
         }
         signal_raise(id, sig);        // re-checks the zombie case for each task
     }
+}
+
+// The System V red zone: 128 bytes below RSP that a leaf function may use WITHOUT
+// adjusting RSP at all. It is not scratch space — it holds live locals — and the
+// compiler is entitled to assume nothing else touches it.
+#define RED_ZONE_BYTES  128
+
+// Forge the ring-3 call frame that runs `sig`'s handler, and point the task at it.
+//
+// This is the interesting part of the whole rung: it is, step for step, what the
+// CPU does in hardware when it takes an interrupt — push enough state to resume,
+// then jump to the handler — except that no hardware does any of it for a signal,
+// so each step is written out here. Three of the eight bug classes are in these
+// twenty lines and none of them announces itself.
+static void deliver_to_handler(registers_t *r, task_t *t, int sig) {
+    uint64_t sp = r->user_rsp;
+
+    // (S2) STEP OVER THE RED ZONE FIRST, before computing anything else.
+    //
+    // The ABI lets a leaf function keep live locals in the 128 bytes below RSP
+    // without adjusting RSP, precisely so short functions need no prologue. Building
+    // the signal frame at user_rsp writes straight over them. The handler then runs
+    // perfectly, returns, and the interrupted function carries on computing with
+    // locals that were quietly replaced by pieces of a saved register frame — a
+    // wrong answer, later, in code that has nothing to do with signals. Linux does
+    // exactly this subtraction, for exactly this reason.
+    sp -= RED_ZONE_BYTES;
+
+    // (S3) ALIGN BEFORE PUSHING THE RETURN ADDRESS, not after.
+    //
+    // The ABI's rule is that RSP % 16 == 8 at a function's first instruction —
+    // 16-byte aligned before the `call`, and the call's 8-byte push is what leaves
+    // the 8. Reproducing that means aligning to 16 here and then pushing the fake
+    // return address below, so the handler sees exactly the stack a real call site
+    // would have produced. Get it wrong and the handler faults on entry, or much
+    // more confusingly survives until the first SSE instruction the compiler emits
+    // for something as ordinary as copying a struct.
+    sp &= ~0xFULL;
+
+    // Room for the saved context, which sigreturn will copy back.
+    sp -= sizeof(registers_t);
+
+    // (S4) BOUNDS-CHECK THE WHOLE SPAN, BEFORE WRITING ANY OF IT.
+    //
+    // user_rsp came from ring 3 and is not to be trusted: it is whatever the program
+    // last put in RSP. The kernel is about to write a whole registers_t plus an
+    // 8-byte return address through it, so the entire span is checked, not just its
+    // start — a pointer sitting just below USER_REGION_END passes a start-only check
+    // and then writes off the end of the region into kernel pages. This is the
+    // confused deputy: the kernel has privileges the program does not, and the
+    // program is choosing the address.
+    //
+    // A task whose stack pointer cannot take the frame CANNOT BE SIGNALLED SAFELY,
+    // so it dies rather than the kernel writing somewhere else. That is what a real
+    // system does too: a stack too broken to deliver on is a segmentation fault.
+    if (!user_range_ok(sp, sizeof(registers_t) + 8)) {
+        task_exit(r, SIG_EXIT_STATUS(SIG_SEGV));
+        return;
+    }
+
+    // Save the interrupted context where sigreturn can find it. The destination is
+    // in the task's own mapped pages, which its CR3 is currently loaded with — this
+    // runs before any switch, on the interrupted task's own address space.
+    memcpy((void *)sp, r, sizeof(registers_t));
+    uint64_t ctx = sp;
+
+    // The fake return address: the handler is an ordinary C function and will end
+    // with `ret`, so something has to be there for it to pop. The trampoline turns
+    // that `ret` into SYS_SIGRETURN.
+    sp -= 8;
+    *(uint64_t *)sp = t->sig_trampoline;
+
+    // Point the task at the handler. From the program's side this is indistinguishable
+    // from having been called normally: first argument in RDI, a return address on
+    // the stack, correct alignment.
+    r->rip      = t->sig_handlers[sig];
+    r->rdi      = (uint64_t)sig;      // the handler's one argument: which signal
+    r->user_rsp = sp;
+
+    t->sig_pending &= ~(1u << sig);   // delivered; do not deliver it again
+    t->sig_active   = 1;              // (S6) no second frame on top of this one
+    t->sig_ctx      = ctx;            // where sigreturn restores from
 }
 
 // ============================================================================
@@ -166,7 +253,88 @@ void check_signals(registers_t *r) {
         return;
     }
 
-    // A handler is installed: forge a frame and run it. That is the next stage; until
-    // then a task with a handler simply keeps its pending bit, which is visible and
-    // harmless rather than silently wrong.
+    // A handler is installed. Everything below builds, by hand, the context the CPU
+    // builds in hardware for an interrupt: save the current state somewhere the
+    // resume path can find it, then point execution at the handler.
+    deliver_to_handler(r, t, sig);
+}
+
+int signal_install_handler(task_t *t, int sig, uint64_t handler, uint64_t trampoline) {
+    // SIG_KILL is not installable, for the same reason check_signals ignores a
+    // handler for it: a signal a program can catch is a request, and there has to be
+    // one that is not. Rejecting it here as well as ignoring it there means a program
+    // finds out it cannot be done, rather than believing it succeeded.
+    if (sig <= 0 || sig >= MAX_SIGS || sig == SIG_KILL) {
+        return -1;
+    }
+
+    // Both addresses are about to become instruction pointers the kernel jumps ring-3
+    // execution to, so both must lie in the ring-3 region. This is cheap and it is
+    // the last chance to reject them: after this they are just numbers in a task
+    // struct, and the next thing that happens to them is `r->rip = handler`.
+    //
+    // A handler of 0 is the way to ask for the DEFAULT action back, so it skips the
+    // range check — 0 is not an address here, it is the absence of one.
+    if (handler != 0 && !user_range_ok(handler, 1)) {
+        return -1;
+    }
+    if (!user_range_ok(trampoline, 1)) {
+        return -1;
+    }
+
+    t->sig_handlers[sig] = handler;
+    t->sig_trampoline = trampoline;
+    return 0;
+}
+
+void signal_sigreturn(registers_t *r) {
+    task_t *t = scheduler_current_task();
+
+    // (S7) IS THERE ACTUALLY A HANDLER RUNNING?
+    //
+    // This call OVERWRITES THE ENTIRE SAVED REGISTER FRAME from user memory. That is
+    // its whole job, and it is also a privilege-escalation primitive if a program can
+    // reach it whenever it likes: the frame includes CS and RFLAGS, so a program that
+    // called sigreturn directly, having arranged its own bytes at sig_ctx, would be
+    // choosing the privilege level and flags it resumes with.
+    //
+    // sig_active is what locks it shut. It is set only by delivery and cleared only
+    // here, so this call is reachable exactly once per delivered signal. A program
+    // that calls it at any other moment is doing something it has no legitimate
+    // reason to do, and is killed rather than obliged.
+    if (!t->sig_active) {
+        task_exit(r, SIG_EXIT_STATUS(SIG_SEGV));
+        return;
+    }
+
+    // The saved context is in user memory and the task has had a whole handler's
+    // worth of execution in which to scribble on it, so it is range-checked again
+    // here rather than trusted because it was valid when it was written.
+    if (!user_range_ok(t->sig_ctx, sizeof(registers_t))) {
+        task_exit(r, SIG_EXIT_STATUS(SIG_SEGV));
+        return;
+    }
+
+    // t->sig_ctx, NOT r->user_rsp. The kernel remembers where it put the context, so
+    // a handler that moved its own stack pointer — deliberately or through a bug —
+    // cannot redirect the restore to bytes of its choosing. The saved location is
+    // kernel state; the stack pointer is not.
+    memcpy(r, (const void *)t->sig_ctx, sizeof(registers_t));
+
+    // DO NOT TRUST THESE THREE, EVEN NOW. Everything just copied came out of user
+    // memory, and the checks above only established that the memory is inside the
+    // ring-3 region — not that its contents are the frame the kernel wrote there. A
+    // handler can rewrite its own saved context before returning.
+    //
+    // So the fields that decide PRIVILEGE are not taken from it. CS and SS are forced
+    // to the known ring-3 selectors, so a restored frame cannot resume in ring 0
+    // however it was doctored, and IF is forced on, so a program cannot resume with
+    // interrupts disabled and keep the CPU forever. Everything else — the general
+    // registers, RIP, RSP — is the program's own state and is its business.
+    r->cs      = GDT_SELECTOR_USER_CODE;
+    r->ss      = GDT_SELECTOR_USER_DATA;
+    r->rflags |= USER_MODE_RFLAGS;
+
+    t->sig_active = 0;    // the handler is done; further signals may be delivered
+    t->sig_ctx    = 0;
 }
