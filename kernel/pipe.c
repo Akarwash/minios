@@ -53,7 +53,14 @@ long pipe_read(pipe_t *p, char *buf, uint32_t len, registers_t *r) {
     // still open, the bytes may yet come, so wait for them. If not, no byte can ever
     // arrive, and that is EOF.
     if (p->writers > 0) {
-        task_block(r, WAIT_PIPE_READ);
+        // A signal can cut this short instead of parking us: task_block reports that
+        // rather than blocking, and the read fails so the signal can be delivered on
+        // the way out. Without it, Ctrl-C on a task blocked reading a pipe would wake
+        // it, have it re-issue the read, find the pipe still empty — a signal is not
+        // data — and block again, forever (S5).
+        if (task_block(r, WAIT_PIPE_READ) == TASK_BLOCK_INTERRUPTED) {
+            return FILE_ERR;
+        }
         return FILE_BLOCKED;      // parked; the caller must not touch rax
     }
     return 0;                     // EOF
@@ -70,7 +77,10 @@ long pipe_write(pipe_t *p, const char *buf, uint32_t len, registers_t *r) {
     uint32_t space = pipe_space(p);
     if (space == 0) {
         // Full, but a reader is alive to drain it: park until it does (backpressure).
-        task_block(r, WAIT_PIPE_WRITE);
+        // Interruptible for the same reason the read above is (S5).
+        if (task_block(r, WAIT_PIPE_WRITE) == TASK_BLOCK_INTERRUPTED) {
+            return FILE_ERR;
+        }
         return FILE_BLOCKED;
     }
 

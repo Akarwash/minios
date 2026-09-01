@@ -176,6 +176,13 @@ static int task_register(address_space_t *as, uint64_t entry, uint32_t parent_id
     t->parent_id = parent_id;     // who to wake and who may read the status below
     t->exit_status = 0;           // only meaningful once the task is a TASK_ZOMBIE
     t->sig_pending = 0;           // nothing raised on a task that has not run yet
+    t->sig_trampoline = 0;        // supplied by the program's first SYS_SIGNAL
+    t->sig_active = 0;            // no handler running
+    t->sig_interrupted = 0;       // no syscall cut short
+    t->sig_ctx = 0;               // only meaningful while sig_active
+    for (int i = 0; i < MAX_SIGS; i++) {
+        t->sig_handlers[i] = 0;   // 0 = no handler = take the default action
+    }
 
     // The group. TASK_PGID_NEW names the group after this task, which is both the
     // Unix convention and, here, what makes a fresh group id unique without a
@@ -520,7 +527,27 @@ static void idle_until_runnable(void) {
 // and unsearchable.
 #define INT_INSTR_LEN 2
 
-void task_block(registers_t *r, wait_reason_t reason) {
+int task_block(registers_t *r, wait_reason_t reason) {
+    // (0) WAS THIS TASK WOKEN TO RECEIVE A SIGNAL RATHER THAN BECAUSE ITS EVENT
+    // HAPPENED? If so, do not block again: report it, so the caller fails its syscall
+    // with SYSCALL_ERROR and check_signals delivers on the way out.
+    //
+    // THIS IS THE COUNTERPART OF THE RE-ARM IN (2) BELOW, and without it a signal
+    // cannot reach a blocked task at all. The re-arm rewinds rip onto the `int 0x50`
+    // so a woken task re-issues its syscall — but the re-arm does not know WHY the
+    // task was woken. signal_raise readies a blocked task so it can receive a signal;
+    // that task then re-runs its read, finds the pipe still empty (nothing wrote to
+    // it — a signal is not data), arrives back here, and would block again. The task
+    // never reaches ring 3, so check_signals never runs, so the signal is never
+    // delivered, and Ctrl-C on a task blocked reading a pipe silently does nothing.
+    //
+    // Cleared here, so one signal cuts one syscall short. See S5 in
+    // docs/decisions/0023-signals.md, and the matching comment in signal_raise.
+    if (tasks[current]->sig_interrupted) {
+        tasks[current]->sig_interrupted = 0;
+        return TASK_BLOCK_INTERRUPTED;
+    }
+
     // (1) Take this task out of the rotation and record what it is waiting for, so
     // the waker for that event can find it again (see scheduler_wake).
     tasks[current]->state = TASK_BLOCKED;
@@ -570,7 +597,9 @@ void task_block(registers_t *r, wait_reason_t reason) {
     schedule(r);
 
     // Unreachable on the blocking path: schedule() redirected the pile, so this
-    // kernel entry now belongs to another task and ends at that iretq.
+    // kernel entry now belongs to another task and ends at that iretq. The return
+    // exists only to satisfy the compiler.
+    return 0;
 }
 
 void scheduler_wake(wait_reason_t reason) {
@@ -871,7 +900,13 @@ void task_wait(registers_t *r) {
     // writing 0 (a perfectly ordinary "child exited successfully" status) would make
     // the woken parent kill itself instead of reporting the result. The shell is
     // usually that parent.
-    task_block(r, WAIT_CHILD);
+    // Interruptible, like every other block: a signal wakes the waiter to receive it
+    // and SYS_WAIT fails, rather than the shell re-issuing the wait forever with the
+    // signal undelivered (S5). SYSCALL_ERROR is already this call's "no children"
+    // answer, and a shell that handles that handles this.
+    if (task_block(r, WAIT_CHILD) == TASK_BLOCK_INTERRUPTED) {
+        r->rax = (uint64_t)-1;
+    }
 }
 
 void schedule(registers_t *r) {

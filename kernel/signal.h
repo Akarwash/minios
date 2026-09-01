@@ -35,4 +35,19 @@ void signal_raise(uint32_t id, int sig);
 // answer for a job whose stages have all already exited.
 void signal_raise_group(uint32_t pgid, int sig);
 
+// Deliver at most one pending signal to the CURRENT task, if this frame is on its
+// way back to ring 3. `r` MUST be the live interrupt frame the stub is about to pop,
+// never a copy: delivery rewrites it in place, and the default action hands it to
+// task_exit, which hands it to schedule().
+//
+// Called at the end of irq_handler AND at the end of the syscall dispatch. Both,
+// not either: the IRQ path is what makes a Ctrl-C during a compute loop take effect,
+// and the syscall path is what makes a signal raised by SYS_KILL take effect at once
+// rather than waiting for the next timer tick.
+//
+// At most ONE signal per call. A second pending signal is delivered on the next way
+// out, which for a killed task never comes and for a handled one is after the
+// handler returns.
+void check_signals(registers_t *r);
+
 #endif

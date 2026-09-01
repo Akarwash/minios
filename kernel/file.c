@@ -76,7 +76,12 @@ long file_read(file_t *f, char *buf, uint32_t len, registers_t *r) {
             return 0;             // end of input: the reader's loop terminates
         }
 
-        task_block(r, WAIT_KEY);
+        // Interruptible: a signal wakes this task to receive it, and the read must
+        // fail rather than park again on a keyboard that never produced a character
+        // (S5). Ctrl-C on a program blocked reading the console depends on this.
+        if (task_block(r, WAIT_KEY) == TASK_BLOCK_INTERRUPTED) {
+            return FILE_ERR;
+        }
         return FILE_BLOCKED;      // parked; the caller must not touch rax
     }
 

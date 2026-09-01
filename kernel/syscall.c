@@ -285,7 +285,15 @@ static void sys_readkey(registers_t *regs) {
         return;
     }
 
-    task_block(regs, WAIT_KEY);
+    // A signal can cut this short rather than parking the task. task_block reports
+    // that, and this call must then FAIL rather than block again — the woken task
+    // would otherwise re-issue SYS_READKEY, find the buffer still empty (Ctrl-C
+    // pushes no character), and park forever with the signal undelivered (S5).
+    // Writing rax here is correct and required: this is a path with an answer.
+    if (task_block(regs, WAIT_KEY) == TASK_BLOCK_INTERRUPTED) {
+        regs->rax = SYSCALL_ERROR;
+        return;
+    }
 
     // Unreachable on the blocking path: task_block redirected the pile through
     // schedule(), so this kernel entry now belongs to another task and ends at its
@@ -617,4 +625,17 @@ void syscall_handler(registers_t *regs) {
             regs->rax = SYSCALL_ERROR;
             break;
     }
+
+    // Deliver on the way out of the syscall too, not only on the timer path. This is
+    // what makes a signal raised BY a syscall take effect immediately: SYS_KILL would
+    // otherwise set a bit and return, and the target would not notice until the next
+    // tick reached it. It is also the path that delivers to a task whose blocking
+    // syscall was just cut short by a signal (S5), which never sees a timer tick in
+    // between.
+    //
+    // Safe on every path through the switch above, including the ones that did not
+    // return here in any ordinary sense: sys_exit and the blocking calls end in
+    // schedule(), which leaves `regs` holding the INCOMING task's frame and `current`
+    // naming that task, so the two still agree and delivery goes to the right place.
+    check_signals(regs);
 }

@@ -5,6 +5,7 @@
 #include "paging.h"
 #include "file.h"
 #include "../include/types.h"
+#include "../include/signals.h"   // MAX_SIGS, for the per-task handler table
 
 // ============================================================================
 // A round-robin preemptive scheduler.
@@ -149,6 +150,45 @@ typedef struct task {
     // gate cleared it on entry).
     uint32_t sig_pending;
 
+    // Ring-3 addresses of this task's signal handlers, indexed by signal number.
+    // 0 means "no handler": take the default action, which is to kill the task. A
+    // handler is installed by SYS_SIGNAL and is only ever called with the CPU already
+    // back in ring 3, on the task's own stack.
+    uint64_t sig_handlers[MAX_SIGS];
+
+    // The ring-3 address a delivered handler "returns" to, supplied by the program
+    // itself on its first SYS_SIGNAL. The kernel cannot pick this address: programs
+    // are separately linked ELFs at a fixed 0x400000 with no kernel-owned page mapped
+    // into them, so there is nowhere kernel-chosen for a trampoline to live.
+    uint64_t sig_trampoline;
+
+    // Is a handler running right now? Set at delivery, cleared by SYS_SIGRETURN.
+    //
+    // TWO JOBS, AND BOTH MATTER. It stops a second signal being delivered on top of a
+    // running handler, which would forge frame after frame down the user stack until
+    // it hit the guard page (S6). And it is what makes SYS_SIGRETURN safe to expose
+    // at all: sigreturn restores the entire register frame from user memory, so a
+    // program that could call it at will could choose its own CS and RFLAGS (S7).
+    int sig_active;
+
+    // Was this task's blocking syscall cut short by a signal? Set by signal_raise
+    // when it wakes a TASK_BLOCKED task, cleared and answered in task_block.
+    //
+    // This exists because of the re-arm. task_block rewinds rip onto the `int 0x50`
+    // so a woken task re-issues its syscall, and that re-arm does not know why the
+    // task was woken. Waking a blocked task to deliver a signal would otherwise have
+    // it re-run the read, find nothing, and block again — forever, with the signal
+    // never delivered. See task_block, and S5 in docs/decisions/0023-signals.md.
+    int sig_interrupted;
+
+    // Where in user memory the interrupted register frame was saved at delivery, for
+    // SYS_SIGRETURN to restore from. Meaningful only while sig_active.
+    //
+    // THE KERNEL REMEMBERS THIS RATHER THAN TRUSTING user_rsp at sigreturn time, so a
+    // handler that moved its own stack pointer cannot redirect where the restore
+    // reads from.
+    uint64_t sig_ctx;
+
     // This task's open descriptors, indexed 0..MAX_FDS-1, NULL where unused. fd 0
     // and fd 1 are a console by convention (input and output); a child in a pipeline
     // has one or both replaced by an inherited pipe end. The number in a descriptor
@@ -220,7 +260,16 @@ void scheduler_start(void);
 // This does not return in any useful sense: control leaves through the redirected
 // iretq, and this kernel entry is over. Nothing a caller writes after it runs on
 // the blocking path.
-void task_block(registers_t *r, wait_reason_t reason);
+// Returns TASK_BLOCK_INTERRUPTED if a signal cut this syscall short instead, in
+// which case the task was NOT blocked, control DID return here, and the caller must
+// fail its syscall with SYSCALL_ERROR rather than pretending it blocked. Returns 0
+// on the blocking path, where nothing the caller writes afterwards ever runs.
+int task_block(registers_t *r, wait_reason_t reason);
+
+// task_block's "I did not block after all" answer. A signal arrived while this task
+// was parked; it was woken to receive it, and its interrupted syscall must report
+// failure rather than silently re-issuing. See S5 in docs/decisions/0023-signals.md.
+#define TASK_BLOCK_INTERRUPTED  (-1)
 
 // Make every task blocked on `reason` runnable again. Called by whatever CAUSES
 // the event, which today means the keyboard IRQ calling scheduler_wake(WAIT_KEY)
