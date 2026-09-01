@@ -15,6 +15,11 @@ case-insensitive).
 Each program is deliberately strange in some way. **Read the paragraph before you
 change one**: what looks like an oversight is usually the thing being tested.
 
+The transcripts below are **captured output**, pasted as the machine printed it,
+interleaving and all. Regenerate them from a real boot whenever the reap line's
+fields change — see the maintenance note in
+[`docs/reference/shell.md`](../../docs/reference/shell.md).
+
 ## A.ELF — the ordinary case
 
 Prints `A` twenty times with a delay between each, then exits with status 0. It has
@@ -23,9 +28,8 @@ loader's zero-fill honest: a program with no `.bss` would load correctly even if
 that step were missing.
 
     > run a.elf
-    run: started a.elf
-    AAAAAAAAAAAAAAAAAAAA
-    reap (wait):    task 1 exited (status 0), free frames: 30592
+    Arun: started a.elf
+    AAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30587, heap used: 616
     run: a.elf exited with status 0
 
 This is the baseline for the memory test. Run it ten times and the free frame count
@@ -65,12 +69,12 @@ what reaches them, and the output below shows how.
 
     > run d.elf
     D: starting E
-    run: started d.elf
     D: not waiting, exiting
-    reap (sweeper): task 1 exited (status 0), free frames: 30519
+    Ereap (sweeper): task 1 exited (status 0), free frames: 30515, heap used: 952
+    run: started d.elf
     run: d.elf exited with status 0
-    > EEEEEEEEEEEEEEE
-    reap (sweeper): task 2 exited (status 7), free frames: 30591
+    > EEEEEEEEEEEEEE
+    > reap (sweeper): task 2 exited (status 7), free frames: 30587, heap used: 616
 
 Both D and E are reaped by the **sweeper**, and which path frees which is decided
 by where they sit in the task table, not by luck. The table is `shell` = 0, `D` =
@@ -93,7 +97,7 @@ again which path frees D before trusting this output.
 
 Two more things the run shows. The prompt returns while E is still printing,
 because the shell waited for D and not for E and stays usable throughout. And D's
-line reports fewer free frames than E's (30519 against 30591 here): when D is swept
+line reports fewer free frames than E's (30515 against 30587 here): when D is swept
 E is still running and holding its own address space, and E's line is the count
 coming back to the baseline once E is gone too.
 

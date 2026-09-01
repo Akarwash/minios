@@ -345,13 +345,20 @@ whose entire program is that it does *not* call `sys_wait`.
 ```
 > run d.elf
 D: starting E
-run: started d.elf
 D: not waiting, exiting
-reap (sweeper): task 1 exited (status 0), free frames: 30520
+Ereap (sweeper): task 1 exited (status 0), free frames: 30515, heap used: 952
+run: started d.elf
 run: d.elf exited with status 0
-> EEEEEEEEEEEEEEE
-reap (sweeper): task 2 exited (status 7), free frames: 30592
+> EEEEEEEEEEEEEE
+> reap (sweeper): task 2 exited (status 7), free frames: 30587, heap used: 616
 ```
+
+That is captured output, pasted as the machine printed it, which is why it looks
+untidy. Two tasks and a shell are printing into one screen with no locking, so a
+line can land in the middle of another one (`Ereap (sweeper):` is an `E` from the
+orphan arriving between the shell's characters), and the order of the `run:` lines
+against the reap line is a scheduling artefact rather than a fixed sequence. E's
+line comes after a `>` because it needed the keypress described below to appear.
 
 Four things to read out of that:
 
@@ -366,7 +373,7 @@ Four things to read out of that:
   the sweeper drops the tombstone rather than keeping a fact nobody can ask for.
   Seven is distinctive purely so it would be obvious, not plausible, if it ever
   turned up at the prompt.
-- **The free frame count comes back to the baseline** — 30592 here — from a path
+- **The free frame count comes back to the baseline** — 30587 here — from a path
   that had never executed before.
 
 One timing quirk worth knowing: if the machine is completely idle when the orphan
@@ -376,6 +383,13 @@ at its idling guard before `reap_sweep` runs, and during the idle loop the zombi
 still `current`, which the sweeper skips by design. The memory comes back on the
 next scheduling event, so this is deferred, not leaked. See
 [scheduling.md](scheduling.md).
+
+**Maintenance note.** The reap-line examples on this page are captured output, not
+prose, and they go stale the moment the reap line's fields change: adding `heap
+used:` to it invalidated every document quoting one, all at once and silently.
+Regenerate them from a real boot whenever those fields change, and paste what the
+machine prints rather than editing the old numbers into shape. The same examples
+appear in [`user/tests/README.md`](../../user/tests/README.md).
 
 ## Building and running the shell
 
