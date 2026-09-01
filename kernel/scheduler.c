@@ -161,6 +161,7 @@ static int task_register(address_space_t *as, uint64_t entry, uint32_t parent_id
     t->wait_reason = WAIT_NONE;   // only meaningful once the task blocks
     t->parent_id = parent_id;     // who to wake and who may read the status below
     t->exit_status = 0;           // only meaningful once the task is a TASK_ZOMBIE
+    t->sig_pending = 0;           // nothing raised on a task that has not run yet
 
     // Install the console descriptors allocated above and clear the rest of the
     // table. From here the task can read fd 0 and write fd 1 the instant it runs.
@@ -296,6 +297,16 @@ uint32_t scheduler_current_id(void) {
     // stamps the new task's parent_id with it), so the id is exported and the table
     // is not.
     return current;
+}
+
+task_t *scheduler_task_by_id(uint32_t id) {
+    // num_tasks is a high-water mark, not a live count: ids are never reused, so a
+    // reaped task leaves a permanent NULL hole that this must step over rather than
+    // dereference. See the tasks[] declaration above.
+    if (id >= num_tasks) {
+        return NULL;
+    }
+    return tasks[id];
 }
 
 task_t *scheduler_current_task(void) {

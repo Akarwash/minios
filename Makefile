@@ -44,7 +44,7 @@ LDFLAGS = -T linker.ld -nostdlib
 # Source files
 C_SOURCES = kernel/kernel.c kernel/gdt.c kernel/idt.c kernel/isr.c kernel/timer.c kernel/memory.c \
             kernel/usermode.c kernel/syscall.c kernel/scheduler.c kernel/heap.c kernel/paging.c \
-            kernel/elf.c kernel/file.c kernel/pipe.c \
+            kernel/elf.c kernel/file.c kernel/pipe.c kernel/signal.c \
             drivers/screen.c drivers/ports.c drivers/keyboard.c drivers/disk.c \
             fs/fat32.c \
             libc/mem.c libc/string.c

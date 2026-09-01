@@ -125,6 +125,17 @@ typedef struct task {
     // the caller has no children at all.
     int32_t exit_status;
 
+    // The set of signals raised on this task and not yet delivered, one bit per
+    // signal number (see include/signals.h). A SET, NOT A QUEUE: raising SIG_INT
+    // twice before either is delivered leaves one bit and produces one delivery,
+    // which is why holding Ctrl-C does not build a backlog of handler runs.
+    //
+    // Written by signal_raise, which may run in interrupt context on another task's
+    // stack, and cleared at delivery. Nothing here needs a lock: this kernel is
+    // single-CPU and every path that touches it runs with IF clear (an interrupt
+    // gate cleared it on entry).
+    uint32_t sig_pending;
+
     // This task's open descriptors, indexed 0..MAX_FDS-1, NULL where unused. fd 0
     // and fd 1 are a console by convention (input and output); a child in a pipeline
     // has one or both replaced by an inherited pipe end. The number in a descriptor
@@ -227,6 +238,15 @@ void task_wait(registers_t *r);
 // who made a request (SYS_RUN stamps the new task's parent_id with it) without
 // scheduler.c having to export the whole task table.
 uint32_t scheduler_current_id(void);
+
+// The live task with this id, or NULL if the id is out of range or names a slot
+// that has been reaped. Exposed so kernel/signal.c can raise a signal on a task
+// that is NOT the running one — the whole point of a signal — without the task
+// table leaving scheduler.c.
+//
+// The returned task may be a TASK_ZOMBIE: a tombstone is still a live slot, and
+// the caller is the one that knows whether a dead task is an error for it.
+task_t *scheduler_task_by_id(uint32_t id);
 
 // The task currently on the CPU: the caller of whatever syscall is being served.
 // Exposed (unlike the rest of the table) because the descriptor syscalls
