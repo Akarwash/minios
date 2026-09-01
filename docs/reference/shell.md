@@ -25,6 +25,8 @@ The names are TownOS's own and deliberately not the Unix ones.
 | `help` | none | Print the command list. |
 | `clear` | none | Clear the screen (scroll it away with newlines). |
 | `return` | text | Print the text back. |
+| `ps` | none | List the live tasks: id, parent, process group, state, and a zombie's exit status. |
+| `kill` | a task id, optionally a signal | Send that signal to that task, defaulting to `SIG_INT` (2). |
 
 An empty line does nothing. Any other first word prints `unknown command: <word>`.
 Filenames are 8.3 and case-insensitive, so `read hello.txt` finds `HELLO.TXT`.
@@ -264,10 +266,13 @@ whole file or refuses it, never a prefix, so that notice could only ever fire fo
 file of exactly the buffer size, which is complete. See
 [decision 0021](../decisions/0021-sys-stat.md).
 
-**The child must exit.** There is no way to kill a task and there are no signals,
-so a program with an unbounded loop leaves the shell blocked in `SYS_WAIT` forever
-and the only way back is a reboot. That is why every program under `user/` runs a
-fixed number of rounds and calls `sys_exit` at the bottom.
+**The child no longer has to exit on its own.** A program with an unbounded loop
+used to leave the shell blocked in `SYS_WAIT` forever, with a reboot the only way
+back, which is why every program under `user/` runs a fixed number of rounds and
+calls `sys_exit` at the bottom. Ctrl-C now interrupts the job in front, and `kill`
+reaches one the keyboard cannot (see [Signals at the prompt](#signals-at-the-prompt)
+below). The fixtures keep their bounded loops, which are now a convenience rather
+than a necessity.
 
 **Printing the status needs a number printer.** There is no libc and the only way
 out is `SYS_WRITE`, which takes a string, so `user/shell.c` has a small
@@ -331,6 +336,8 @@ name in the root, so `run a.elf` finds them (the lookup is case-insensitive).
 | `C.ELF` | prints `C` 40 times | 3 | a non-zero status survives the trip back to the prompt |
 | `D.ELF` | starts `E.ELF`, exits without waiting | 0 | orphans E; see below |
 | `E.ELF` | prints `E` 15 times | 7 | the orphan nobody reaps |
+| `H.ELF` | prints `H` 40 times, catches `SIG_INT` | 0 | a program that is interrupted and RESUMED, not killed |
+| `ONCE.ELF` | reads fd 0 once and exits | 0 | the reader that leaves early, so a writer gets `SIG_PIPE` |
 
 ### What `run d.elf` demonstrates
 
@@ -344,13 +351,13 @@ whose entire program is that it does *not* call `sys_wait`.
 
 ```
 > run d.elf
-D: starting E
-D: not waiting, exiting
-Ereap (sweeper): task 1 exited (status 0), free frames: 30515, heap used: 952
 run: started d.elf
+D: starting E
+ED: not waiting, exiting
+reap (sweeper): task 1 exited (status 0), free frames: 30513, heap used: 1816
 run: d.elf exited with status 0
 > EEEEEEEEEEEEEE
-> reap (sweeper): task 2 exited (status 7), free frames: 30587, heap used: 616
+> reap (sweeper): task 2 exited (status 7), free frames: 30585, heap used: 1192
 ```
 
 That is captured output, pasted as the machine printed it, which is why it looks
@@ -373,7 +380,7 @@ Four things to read out of that:
   the sweeper drops the tombstone rather than keeping a fact nobody can ask for.
   Seven is distinctive purely so it would be obvious, not plausible, if it ever
   turned up at the prompt.
-- **The free frame count comes back to the baseline** — 30587 here — from a path
+- **The free frame count comes back to the baseline** — 30585 here — from a path
   that had never executed before.
 
 One timing quirk worth knowing: if the machine is completely idle when the orphan
@@ -390,6 +397,61 @@ used:` to it invalidated every document quoting one, all at once and silently.
 Regenerate them from a real boot whenever those fields change, and paste what the
 machine prints rather than editing the old numbers into shape. The same examples
 appear in [`user/tests/README.md`](../../user/tests/README.md).
+
+## Signals at the prompt
+
+**Ctrl-C** interrupts the job in front. The shell puts every job — a pipeline and a
+plain `run` alike — in its own process group, hands the keyboard to that group before
+waiting, and takes it back afterwards on every path, including the failure ones. So
+Ctrl-C during `run b.elf` stops `b.elf` (status 130) and returns you to a prompt, and
+Ctrl-C on a three-stage pipeline stops all three stages, because they are one group.
+
+At an idle prompt Ctrl-C reaches the **shell itself**, and the shell catches it: it
+abandons the half-typed line and prints a fresh prompt, which is what every real
+shell does. That handler is not politeness, it is a safety net — without it a Ctrl-C
+that reached task 0 would kill it, and since nothing waits on task 0 there would not
+even be a reap line, just a machine that stops responding with no way to start
+another shell.
+
+**Ctrl-D** ends console input, so a program that reads until end of file finishes:
+
+```
+> run count.elf
+hello
+5
+run: count.elf exited with status 0
+```
+
+### `ps` and `kill`
+
+```
+> run d.elf
+...
+> ps
+  id  parent  pgid  state    status
+  0   -       0     running
+  2   1       1     ready
+> kill 2
+reap (sweeper): task 2 exited (status 130), free frames: 30585, heap used: 1192
+```
+
+**These two exist because the keyboard cannot reach everything, and that is by
+design rather than an oversight.** Ctrl-C is addressed to the foreground group only.
+After `run d.elf`, `E.ELF` is in D's group — a group this shell is not in and cannot
+hand the keyboard to — so **Ctrl-C can never reach it**. `ps` shows that it exists
+and which group it is in; `kill` stops it. Without both, this kernel would have tasks
+that nothing could stop.
+
+They are a pair and neither is much use alone: `kill` needs an id, and an id the user
+has to guess is not an interface. The `pgid` column is the one to read when something
+will not die.
+
+`kill <id>` sends `SIG_INT` — the same signal Ctrl-C sends, so it is "Ctrl-C, but
+aimed". `kill <id> 9` sends `SIG_KILL`, which **cannot be caught**, for a program
+that has a handler and declines to stop. A catchable signal is a request.
+
+See [signals.md](signals.md) and
+[decision 0023](../decisions/0023-signals.md).
 
 ## Building and running the shell
 

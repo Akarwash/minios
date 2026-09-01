@@ -2,7 +2,19 @@
 
 ## Status
 
-Accepted.
+Accepted. Extended — the decision stands, one detail of the body does not.
+
+- **`task_block` no longer always blocks.** It returns
+  `TASK_BLOCK_INTERRUPTED` when a signal was raised on the task while it was
+  parked, and the caller then fails its syscall instead of blocking again. This
+  was added by [0023](0023-signals.md), whose S5 explains why the re-arm
+  described here makes it necessary: the rewind onto `int 0x50` does not know
+  *why* a task was woken, so a task woken to receive a signal would re-issue its
+  syscall, find its event still absent, and park again forever.
+
+The re-arm itself, the block/wake pairing rule, the idle loop and the nesting
+guard are unchanged. See [reference/blocking.md](../reference/blocking.md) and
+[reference/signals.md](../reference/signals.md) for the current state.
 
 ## Context
 

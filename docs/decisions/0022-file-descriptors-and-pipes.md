@@ -2,7 +2,25 @@
 
 ## Status
 
-Accepted.
+Accepted. Partly superseded — the decision stands, three details of the body do not.
+
+- **Signals are no longer deferred.** Decision 1 of this ADR excluded them
+  ("Signals share no machinery with this. Both are later rungs"), which was right
+  about the mechanism and wrong about the consequences.
+  [0023](0023-signals.md) adds them.
+- **`pipe_write` against a dead reader raises `SIG_PIPE`** rather than returning
+  a bare error. The body's reasoning — that an error return was enough for a
+  kernel with no signals — was true when written and is no longer the behaviour:
+  an error return only reaches a program that checks return values, and a writer
+  that does not spins forever.
+- **A console now has an end of file.** The body says signalling one would need a
+  Ctrl-D-style key and a line discipline the driver does not have; [0023](0023-signals.md)
+  adds exactly that, as one flag.
+
+The descriptor table, the one-owner-per-slot rule, the reader/writer counts, the
+block/wake rules and the six pipe bug classes (B1–B6) are unchanged. See
+[reference/pipes.md](../reference/pipes.md) and
+[reference/signals.md](../reference/signals.md) for the current state.
 
 ## Context
 

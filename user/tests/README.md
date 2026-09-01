@@ -28,8 +28,8 @@ loader's zero-fill honest: a program with no `.bss` would load correctly even if
 that step were missing.
 
     > run a.elf
-    Arun: started a.elf
-    AAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30587, heap used: 616
+    run: started a.elf
+    AAAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30585, heap used: 1192
     run: a.elf exited with status 0
 
 This is the baseline for the memory test. Run it ten times and the free frame count
@@ -68,13 +68,13 @@ here: the free path that tears a zombie's address space down, and the branch of
 what reaches them, and the output below shows how.
 
     > run d.elf
-    D: starting E
-    D: not waiting, exiting
-    Ereap (sweeper): task 1 exited (status 0), free frames: 30515, heap used: 952
     run: started d.elf
+    D: starting E
+    ED: not waiting, exiting
+    reap (sweeper): task 1 exited (status 0), free frames: 30513, heap used: 1816
     run: d.elf exited with status 0
     > EEEEEEEEEEEEEE
-    > reap (sweeper): task 2 exited (status 7), free frames: 30587, heap used: 616
+    > reap (sweeper): task 2 exited (status 7), free frames: 30585, heap used: 1192
 
 Both D and E are reaped by the **sweeper**, and which path frees which is decided
 by where they sit in the task table, not by luck. The table is `shell` = 0, `D` =
@@ -97,7 +97,7 @@ again which path frees D before trusting this output.
 
 Two more things the run shows. The prompt returns while E is still printing,
 because the shell waited for D and not for E and stays usable throughout. And D's
-line reports fewer free frames than E's (30515 against 30587 here): when D is swept
+line reports fewer free frames than E's (30513 against 30585 here): when D is swept
 E is still running and holding its own address space, and E's line is the count
 coming back to the baseline once E is gone too.
 
@@ -196,10 +196,16 @@ means the stage downstream is gone and there is nothing left to do.
 
 ## Why every loop is bounded
 
-There is no way to kill a task and there are no signals. A program that never exits
-leaves its parent blocked in `SYS_WAIT` with no way back short of a reboot, so
-`run <that program>` would make the shell permanently unusable. `A`–`F` therefore run
-a fixed number of rounds and call `sys_exit` at the bottom. `COUNT` and `UPPER` are
+A program that never exits used to leave its parent blocked in `SYS_WAIT` with no way
+back short of a reboot, so `run <that program>` would make the shell permanently
+unusable. `A`–`F` therefore run a fixed number of rounds and call `sys_exit` at the
+bottom.
+
+**Signals changed the stakes but not the rule.** Ctrl-C and `kill` can now stop a
+runaway task ([signals.md](../../docs/reference/signals.md)), so a bounded loop is a
+convenience rather than the only protection. Keep them bounded anyway: a fixture that
+needs a keystroke to finish cannot be run unattended, and a test whose result depends
+on how fast somebody presses a key is not a test. `COUNT` and `UPPER` are
 bounded differently: they loop until end of file, which a **pipe** always delivers
 (the writer closes) but a **console** never does, so they terminate when piped and do
 not when run alone on the console — which is why they are pipeline fixtures, not

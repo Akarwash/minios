@@ -14,11 +14,15 @@
 // that step were missing.
 static volatile unsigned long iterations;
 
-// How many letters to print before exiting. THE LOOP MUST BE BOUNDED. It used to
-// run forever, which was fine when nothing waited for it; now the shell blocks in
-// sys_wait until this program is done, and there is no way to kill a running task
-// and no signals, so a program that never exits leaves the shell permanently
-// unusable with no way back short of a reboot.
+// How many letters to print before exiting. THE LOOP STAYS BOUNDED. It used to run
+// forever, which was fine when nothing waited for it; then the shell began blocking
+// in sys_wait until this program is done, and with no way to kill a task a program
+// that never exited left the shell permanently unusable.
+//
+// Signals changed the stakes but not the rule: Ctrl-C or `kill` can stop a runaway
+// task now, so the bound is a convenience rather than the only protection. Keep it
+// anyway — a fixture that needs a keystroke to finish cannot be run unattended, and
+// a test whose result depends on how fast somebody presses a key is not a test.
 #define A_ROUNDS  20
 
 // The entry point named by user.ld's ENTRY(_start). The loader takes the entry

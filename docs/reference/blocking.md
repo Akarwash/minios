@@ -348,3 +348,31 @@ there is a re-check loop somewhere.
   [decision 0016](../decisions/0016-interactive-shell.md).
 - The second wait reason, and the zombie state it collects from:
   [decision 0018](../decisions/0018-process-lifecycle-exit-and-wait.md).
+
+## A block can now be interrupted by a signal
+
+`task_block` returns `TASK_BLOCK_INTERRUPTED` instead of parking when a signal was
+raised on this task while it was blocked. The caller must then **fail its syscall**
+rather than block again.
+
+This exists because the re-arm above is unconditional. It rewinds `rip` onto the
+`int 0x50` so a woken task re-issues its syscall — but it does not know *why* the
+task was woken. `signal_raise` readies a blocked task so the signal can be delivered
+on its way out to ring 3; without a way to say "this wake was not your event", that
+task would re-run its read, find the pipe still empty (a signal is not data), and
+park again. Forever, with the signal pending and nothing visibly wrong.
+
+```c
+if (tasks[current]->sig_interrupted) {
+    tasks[current]->sig_interrupted = 0;
+    return TASK_BLOCK_INTERRUPTED;
+}
+```
+
+Every blocking call honours it — the console read, both pipe directions,
+`SYS_READKEY`, `SYS_WAIT` — and a new one must too. From ring 3 the effect is that a
+blocking call can return `SYS_FAIL` because a signal ran, not because anything is
+wrong; a caller must not treat that as data.
+
+See [signals.md](signals.md) and S5 in
+[decision 0023](../decisions/0023-signals.md).

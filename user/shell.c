@@ -419,10 +419,12 @@ static void cmd_run(char *name) {
     // detach: the prompt does not come back until the program is finished, because
     // this call blocks until it is. Costs no CPU while it waits (see sys_wait).
     //
-    // THE CHILD MUST EXIT. There is no way to kill a task and there are no signals,
-    // so if the program never calls sys_exit, this shell blocks here forever and the
-    // only way back is a reboot. That is why every program in user/ has a bounded
-    // loop.
+    // THE CHILD NO LONGER HAS TO EXIT ON ITS OWN. This used to be a trap: a program
+    // that never called sys_exit blocked this shell here forever with a reboot the
+    // only way back. Ctrl-C is addressed to the job's group (set just above), so an
+    // unbounded program can be stopped, and `kill` reaches one the keyboard cannot.
+    // The fixtures in user/ keep their bounded loops regardless, so they can be run
+    // unattended.
     // Hand the keyboard to the job, wait for it, and take it back. sys_setfg is the
     // declaration that this group is what Ctrl-C means from here until the job ends.
     sys_setfg(id);

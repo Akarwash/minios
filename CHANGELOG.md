@@ -32,6 +32,85 @@ corrected on sight, or the source.
 
 ### Added
 
+- Signals, the last rung of phase 1: a way to interrupt a running ring-3 program,
+  and to have it resume afterwards. **A signal is what an interrupt is, one layer
+  up, and no hardware does any of it** — every step the CPU performs for an
+  interrupt is written by hand in a new `kernel/signal.{h,c}`. `include/signals.h`
+  holds the four numbers (`SIG_INT` 2, `SIG_KILL` 9, `SIG_SEGV` 11, `SIG_PIPE` 13)
+  shared with ring 3, and a task killed by signal N exits with status 128 + N, so
+  Ctrl-C gives 130. Raising and delivering are deliberately separate halves:
+  `signal_raise`/`signal_raise_group` set a bit in `task_t.sig_pending` and return,
+  which is what makes them safe to call from the keyboard IRQ, while `check_signals`
+  delivers at the end of `irq_handler` **and** at the end of the syscall dispatch —
+  every path back to ring 3, and nowhere else. The pending set is a set, not a
+  queue, so holding Ctrl-C produces one delivery rather than a backlog. With no
+  handler the default action is `task_exit(r, 128 + sig)`; with one, the kernel
+  forges on the program's own stack the call frame a real `call` would have produced
+  (step over the 128-byte red zone, align to 16 *before* pushing the fake return
+  address, range-check the whole span it is about to write through), points `rip` at
+  the handler, passes the signal in RDI, and writes a trampoline address where a
+  return address belongs. **`SIG_KILL` ignores handlers entirely**: a signal a
+  program can catch is a request, and a system needs one that is not.
+- `SYS_SIGNAL` (14), `SYS_KILL` (15), `SYS_SIGRETURN` (16), `SYS_SETFG` (17) and
+  `SYS_TASKS` (18), for nineteen calls. `SYS_SIGRETURN` restores the context saved
+  at delivery and is locked shut behind a `sig_active` flag, re-range-checks the
+  context, reads it from the kernel-remembered `sig_ctx` rather than the program's
+  `user_rsp`, and forces CS, SS and the interrupt flag rather than trusting the
+  values it just copied out of user memory — it overwrites the entire register
+  frame, which is a privilege-escalation primitive if reachable at will.
+- The signal trampoline, `user/trampoline.asm`, assembled into every user program.
+  **The kernel cannot pick this address**: programs are separately linked ELFs at a
+  fixed `0x400000` with no kernel-owned page mapped into them, so no kernel-side
+  address is executable from ring 3. The program supplies it and `userlib.h` hides
+  the argument, so a program writes `sys_signal(SIG_INT, handler)`. Linux answers
+  the same problem the same way, with the vDSO.
+- Process groups (`task_t.pgid`), so Ctrl-C addresses a **job** rather than a task —
+  a three-stage pipeline is three tasks and one thing to whoever typed it. A group
+  is named after its leading task, which makes a new group id unique for free since
+  task ids are never reused. `SYS_RUN` grows a fourth argument in RCX (0 inherit,
+  `SYS_RUN_GROUP_NEW`, or a group to join), leaving its existing three arguments
+  meaning exactly what they always did; RCX rather than R10 because `int 0x50`,
+  unlike the `syscall` instruction, does not clobber it.
+- A **declared** foreground group, `SYS_SETFG`, never inferred. `D.ELF` is the proof
+  it cannot be inferred: D starts E and exits without waiting, so a foreground
+  derived from "most recently started" would follow to E and stay there while the
+  user sits at a prompt. A task may name only its own group or a group one of its
+  own children is in — without that rule any program could take the keyboard and
+  never give it back, and no privileged task exists here that could take it away.
+- `ps` and `kill` shell commands, over `SYS_TASKS` and `SYS_KILL`, with a new
+  `include/taskinfo.h` carrying the `task_info_t` that crosses the ring boundary
+  (its state vocabulary is deliberately separate from the kernel's `task_state_t`,
+  mapped by an explicit switch, so splitting an internal state cannot silently
+  change what a compiled `ps` prints). **They exist because the keyboard cannot
+  reach everything, by design**: Ctrl-C goes to the foreground group only, so
+  `E.ELF` after `run d.elf` is unreachable from the keyboard. `ps` finds it and
+  `kill` stops it; without both, the kernel has tasks nothing can stop.
+- Left-ctrl tracking in `drivers/keyboard.c`, on the same pattern as shift.
+  **Ctrl-C and Ctrl-D push no character and return before the character path's
+  `scheduler_wake(WAIT_KEY)`**, exactly as the modifier keys do — a wake with an
+  empty ring gives every sleeper a wasted round trip, so holding ctrl would
+  otherwise spin the scheduler.
+- Ctrl-D and a console end of file, the whole of this kernel's line discipline: one
+  `console_eof` flag, test-and-cleared by the reader, reported as a zero-byte read.
+  `file_read` drains buffered characters *before* checking it, so typing `abc` then
+  Ctrl-D yields `abc` and then 0. This makes `run count.elf` on its own terminable,
+  which verification 9 of the pipes rung found impossible.
+- `SIG_PIPE`: `pipe_write` with `readers == 0` now raises a signal instead of only
+  returning an error, so `run g.elf | run once.elf` terminates rather than leaving
+  the writer spinning against a dead buffer. An error return reaches only a program
+  that checks return values; a signal reaches one that does not. It is catchable on
+  purpose, so a program can handle a vanished reader itself.
+- Test fixtures `H.ELF` (catches `SIG_INT`, counts the catches and prints the total,
+  so the **resume** is what is tested rather than just the delivery) and `ONCE.ELF`
+  (reads fd 0 once and exits, the reader that leaves early).
+- `docs/decisions/0023-signals.md` and `docs/reference/signals.md`. The ADR carries
+  a catalogue of the **eight ways this goes wrong (S1–S8), six of them silently** —
+  delivering while returning to ring 0, the red zone, stack alignment, an
+  unvalidated `user_rsp`, delivering to a blocked task, nested delivery during a
+  handler, `sigreturn` without a live frame, and Ctrl-C reaching the shell — each
+  with its symptom, its cause, and the lines that prevent it. None is inferable from
+  reading the working code, because working code shows the fix and never the failure.
+
 - File descriptors and pipes, so one program's output can be another's input and the
   shell can run `run A | run B | run C`. Every task gains a fixed table of open
   destinations (`task_t.fds[MAX_FDS]`, `MAX_FDS` = 8) in a new `kernel/file.{h,c}`: a
@@ -838,6 +917,35 @@ corrected on sight, or the source.
   driver; the duplicate is gone.
 
 ### Changed
+- `task_block` returns `TASK_BLOCK_INTERRUPTED` instead of always blocking. **This
+  is the subtlest interaction in the signals rung.** Delivery happens on the way out
+  to ring 3 and a blocked task is not on its way anywhere, so `signal_raise` readies
+  it — but the re-arm that rewinds `rip` onto the `int 0x50` does not know *why* a
+  task was woken, so it would re-run its read, find its event still absent (a signal
+  is not data), and park again forever with the signal undelivered. `sig_interrupted`
+  breaks that loop and the syscall fails with `SYSCALL_ERROR`. Every blocking call
+  honours it: the console read, both pipe directions, `SYS_READKEY`, `SYS_WAIT`.
+- The shell puts every job — a pipeline and a plain `run` alike — in its own process
+  group, hands the keyboard over with `sys_setfg`, and **takes it back
+  unconditionally** on every exit path including the failure `goto`s; a shell that
+  restored the foreground only on success would lose the keyboard the first time
+  anything went wrong. It also registers a `SIG_INT` handler of its own that abandons
+  the half-typed line and prints a fresh prompt, so a Ctrl-C that does reach task 0
+  behaves rather than killing the machine's only shell.
+- `read_line` treats `SYS_FAIL` from `sys_readkey` as "a signal ran", not as a
+  character. It had been storing the `-1` as a byte, so a Ctrl-C at the prompt left
+  invisible `0xFF`s in the line buffer and the next command was rejected as unknown
+  for no visible reason.
+- `user_range_ok` moved from `kernel/syscall.c` to `kernel/memory.h`, beside the two
+  region constants it tests against, so signal delivery applies the identical check
+  to the frame it writes through a ring-3 stack pointer. Two spellings of one
+  security check is how one of them ends up subtly weaker.
+- Regenerated the reap-line examples in `docs/reference/shell.md` and
+  `user/tests/README.md` from a real boot. Adding `heap used:` to the reap line in
+  the previous tranche made every document quoting one stale at a stroke, and the
+  free-frame numbers they carried were already wrong against the real baseline. Both
+  files now say the examples are captured output that must be regenerated whenever
+  the reap line's fields change.
 
 - `kernel_main` now creates two ring-3 tasks and starts the scheduler
   (`scheduler_start`) as its last act instead of calling `enter_user_mode`

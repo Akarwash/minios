@@ -2,7 +2,16 @@
 
 ## Status
 
-Accepted.
+Accepted. Extended — the decision stands and now covers a third modifier.
+
+- **Left ctrl is tracked too**, added by [0023](0023-signals.md) on exactly the
+  pattern this ADR sets out for shift: a state of the hardware, set on press and
+  cleared on release, resolved in the driver and never sent to ring 3. Ctrl-C and
+  Ctrl-D are decoded here and produce no character at all. Right ctrl remains
+  untracked for the reason this body already gives about extended scancodes.
+
+See [reference/keyboard.md](../reference/keyboard.md) and
+[reference/signals.md](../reference/signals.md) for the current state.
 
 ## Context
 
