@@ -106,7 +106,8 @@ $(USER_TRAMPOLINE_OBJ): $(USER_TRAMPOLINE_SRC)
 
 USER_PROGRAMS = user/tests/A.ELF user/tests/B.ELF user/tests/C.ELF \
                 user/tests/D.ELF user/tests/E.ELF user/tests/F.ELF user/tests/G.ELF \
-                user/tests/COUNT.ELF user/tests/UPPER.ELF user/tests/H.ELF user/SHELL.ELF
+                user/tests/COUNT.ELF user/tests/UPPER.ELF user/tests/H.ELF \
+                user/tests/ONCE.ELF user/SHELL.ELF
 
 user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h $(USER_TRAMPOLINE_OBJ)
 	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
