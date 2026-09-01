@@ -10,6 +10,7 @@
 #include "../libc/mem.h"
 #include "../include/syscalls.h"
 #include "signal.h"
+#include "../include/taskinfo.h"
 
 // The most bytes one SYS_READ or SYS_WRITE moves in a single call. A counted
 // buffer from ring 3 is copied through a kernel staging buffer of this size, so a
@@ -591,6 +592,88 @@ static void sys_sigreturn(registers_t *r) {
     signal_sigreturn(r);
 }
 
+// SYS_KILL: raise a signal on a task by id.
+//   RDI = task id, RSI = signal number.
+// Returns 0, or SYSCALL_ERROR if there is no such live task, if it is already a
+// zombie, or if the signal is not one this kernel has.
+//
+// THIS EXISTS BECAUSE THE KEYBOARD CANNOT REACH EVERYTHING, and that is by design
+// rather than an oversight. Ctrl-C goes to the foreground group only, so a program
+// left running in another group — anything started by a parent that then exited,
+// which is exactly what `run d.elf` produces — is unreachable from the keyboard.
+// Without this call the kernel would have tasks that nothing could stop.
+//
+// The result is checked rather than assumed so `kill` can report a bad id instead of
+// silently doing nothing, which is the difference between a tool and a guess.
+// Delivery is prompt: check_signals runs at the end of this dispatch, so a signal
+// raised here takes effect without waiting for a timer tick. Does not block.
+static uint64_t sys_kill(uint64_t id, uint64_t sig) {
+    task_t *t = scheduler_task_by_id((uint32_t)id);
+    if (t == NULL || t->state == TASK_ZOMBIE) {
+        return SYSCALL_ERROR;
+    }
+    if ((int)sig <= 0 || (int)sig >= MAX_SIGS) {
+        return SYSCALL_ERROR;
+    }
+    signal_raise((uint32_t)id, (int)sig);
+    return 0;
+}
+
+// Map a kernel task state onto the number that crosses the ring boundary. The two
+// are deliberately different vocabularies (see include/taskinfo.h): this switch is
+// where a new internal state has to be considered rather than leaking out with
+// whatever value it happened to be given.
+static uint32_t task_state_for_ring3(task_state_t state) {
+    switch (state) {
+        case TASK_READY:   return TASK_INFO_READY;
+        case TASK_RUNNING: return TASK_INFO_RUNNING;
+        case TASK_BLOCKED: return TASK_INFO_BLOCKED;
+        case TASK_ZOMBIE:  return TASK_INFO_ZOMBIE;
+        default:           return 0;   // TASK_UNUSED: never published, see below
+    }
+}
+
+// SYS_TASKS: report the live tasks, one task_info_t each.
+//   RDI = buffer, RSI = size in bytes.
+// Returns the number of entries written, or SYSCALL_ERROR on a bad buffer.
+//
+// The buffer is a WRITE TARGET from ring 3, so its WHOLE span is bounds-checked
+// before a byte goes through it — the same rule as SYS_LIST's and SYS_STAT's, and
+// for the same reason. A short buffer is not an error: it is filled to capacity and
+// the count returned is what fitted, so a caller with a small array gets a truncated
+// answer rather than a failure.
+//
+// This is the kernel's first debugging tool and the first time the task table has
+// been visible from outside the kernel at all. It exists so `kill` takes a looked-up
+// id rather than a guessed one.
+static uint64_t sys_tasks(uint64_t user_buf, uint64_t bufsize) {
+    if (!user_range_ok(user_buf, bufsize)) {
+        print_string("syscall: SYS_TASKS rejected an out-of-bounds buffer\n");
+        return SYSCALL_ERROR;
+    }
+
+    uint64_t capacity = bufsize / sizeof(task_info_t);
+    task_info_t *out = (task_info_t *)user_buf;
+    uint64_t n = 0;
+
+    uint32_t limit = scheduler_task_count();
+    for (uint32_t id = 0; id < limit && n < capacity; id++) {
+        task_t *t = scheduler_task_by_id(id);
+        if (t == NULL) {
+            continue;      // a reaped task's permanent hole; ids are never reused
+        }
+        out[n].id = t->id;
+        out[n].parent_id = t->parent_id;
+        out[n].pgid = t->pgid;
+        out[n].state = task_state_for_ring3(t->state);
+        // Only a zombie has a status anybody may read. Before the exit the field is 0
+        // and means nothing, so reporting it would invite a caller to believe it.
+        out[n].exit_status = (t->state == TASK_ZOMBIE) ? t->exit_status : 0;
+        n++;
+    }
+    return n;
+}
+
 // Dispatch on the call number in RAX. Unknown numbers are reported and rejected
 // with SYSCALL_ERROR; a bad request must never fault or halt the kernel.
 void syscall_handler(registers_t *regs) {
@@ -642,6 +725,12 @@ void syscall_handler(registers_t *regs) {
             break;
         case SYS_SIGNAL:
             regs->rax = sys_signal(regs->rdi, regs->rsi, regs->rdx);
+            break;
+        case SYS_KILL:
+            regs->rax = sys_kill(regs->rdi, regs->rsi);
+            break;
+        case SYS_TASKS:
+            regs->rax = sys_tasks(regs->rdi, regs->rsi);
             break;
         case SYS_SIGRETURN:
             sys_sigreturn(regs);   // rewrites the whole pile; deliberately not `regs->rax = ...`

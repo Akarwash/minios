@@ -14,6 +14,7 @@
 // kernel_main. See docs/reference/shell.md.
 
 #include "userlib.h"
+#include "../include/taskinfo.h"
 
 // The line buffer is fixed. If it fills, further printable characters are DROPPED
 // rather than accepted, so a long line cannot overflow it; one slot is reserved
@@ -44,6 +45,11 @@
 
 // Static (in .bss, inside the ring-3 region), not on the stack: the file buffer is
 // large, and keeping these off the 256KB user stack leaves it for call frames.
+// How many tasks `ps` will report at once. MAX_TASKS_LIMIT in the kernel is 64, so
+// this covers every task the machine can have; SYS_TASKS truncates rather than
+// failing if it ever does not.
+#define SHELL_MAX_TASKS  64
+
 static char line[SHELL_LINE_MAX];
 
 // Set by the handler, read and cleared by read_line. A handler cannot reach
@@ -146,6 +152,115 @@ static void print_help(void) {
     sys_print("  help                 show this list\n");
     sys_print("  clear                clear the screen\n");
     sys_print("  return <text>        print the text back\n");
+    sys_print("  ps                   list the running tasks\n");
+    sys_print("  kill <id> [sig]      send a signal to a task (default 2, interrupt)\n");
+}
+
+// Parse a non-negative decimal number. Returns 0 and sets *ok to 0 on anything that
+// is not entirely digits, so `kill abc` is rejected rather than silently killing
+// task 0 — which is the shell, and which nothing could restart.
+static unsigned long parse_uint(const char *s, int *ok) {
+    unsigned long v = 0;
+    int digits = 0;
+    for (; *s != '\0'; s++) {
+        if (*s < '0' || *s > '9') {
+            *ok = 0;
+            return 0;
+        }
+        v = v * 10 + (unsigned long)(*s - '0');
+        digits++;
+    }
+    *ok = digits > 0;
+    return v;
+}
+
+// The names the TASK_INFO_* states print as. A task's state is the single most
+// useful thing on the line: it says whether a task is doing work, waiting for
+// something, or already dead and merely uncollected.
+static const char *state_name(unsigned long state) {
+    if (state == TASK_INFO_READY)   return "ready";
+    if (state == TASK_INFO_RUNNING) return "running";
+    if (state == TASK_INFO_BLOCKED) return "blocked";
+    if (state == TASK_INFO_ZOMBIE)  return "zombie";
+    return "?";
+}
+
+// `ps`: list every live task.
+//
+// The pgid column is the one to read when something will not die. Ctrl-C is
+// addressed to the FOREGROUND GROUP only, so a task whose pgid is not the shell's
+// cannot be reached from the keyboard at all — which is exactly what `run d.elf`
+// leaves behind, since D exits without waiting and E carries on in D's group with
+// nobody to hand the keyboard to it. `ps` is how you find it and `kill` is how you
+// stop it; without both, this kernel has tasks that nothing can stop.
+static void cmd_ps(void) {
+    task_info_t tasks[SHELL_MAX_TASKS];
+    unsigned long n = syscall2(SYS_TASKS, (unsigned long)tasks, sizeof(tasks));
+    if (n == SYS_FAIL) {
+        sys_print("ps: could not read the task table\n");
+        return;
+    }
+
+    sys_print("  id  parent  pgid  state    status\n");
+    for (unsigned long i = 0; i < n; i++) {
+        sys_print("  ");
+        print_uint(tasks[i].id);
+        sys_print("   ");
+        // A task nobody started has no parent to name. The kernel's sentinel for that
+        // is 0xFFFFFFFF, which printed as a number is nine digits of noise.
+        if (tasks[i].parent_id == 0xFFFFFFFFu) {
+            sys_print("-");
+        } else {
+            print_uint(tasks[i].parent_id);
+        }
+        sys_print("       ");
+        print_uint(tasks[i].pgid);
+        sys_print("     ");
+        sys_print(state_name(tasks[i].state));
+        // Only a zombie has a status worth printing; for anything else the field is 0
+        // and means nothing at all.
+        if (tasks[i].state == TASK_INFO_ZOMBIE) {
+            sys_print("   ");
+            print_uint((unsigned long)tasks[i].exit_status);
+        }
+        sys_print("\n");
+    }
+}
+
+// `kill <id> [sig]`: send a signal to a task by id, defaulting to SIG_INT — the
+// same signal Ctrl-C sends, so `kill <id>` is "Ctrl-C, but aimed".
+//
+// Pass 9 (SIG_KILL) for a task that has a handler and declines to stop: SIG_KILL
+// cannot be caught, which is the whole reason it exists. A catchable signal is a
+// request.
+static void cmd_kill(char *id_tok, char *sig_tok) {
+    if (id_tok == (char *)0) {
+        sys_print("kill: missing task id (try 'ps')\n");
+        return;
+    }
+    int ok = 0;
+    unsigned long id = parse_uint(id_tok, &ok);
+    if (!ok) {
+        sys_print("kill: task id must be a number\n");
+        return;
+    }
+
+    unsigned long sig = SIG_INT;
+    if (sig_tok != (char *)0) {
+        sig = parse_uint(sig_tok, &ok);
+        if (!ok) {
+            sys_print("kill: signal must be a number\n");
+            return;
+        }
+    }
+
+    if (sys_kill(id, (int)sig) == SYS_FAIL) {
+        // A bad id is reported rather than passed over in silence: "nothing happened"
+        // and "there was nothing there" look identical otherwise, and the second is
+        // the one a user needs to know about.
+        sys_print("kill: no such task, or not a signal this kernel has\n");
+        return;
+    }
 }
 
 static void cmd_list(void) {
@@ -658,6 +773,12 @@ void _start(void) {
             cmd_clear();
         } else if (str_eq(cmd, "return")) {
             cmd_return(pos);   // the raw remainder after the "return" token
+        } else if (str_eq(cmd, "ps")) {
+            cmd_ps();
+        } else if (str_eq(cmd, "kill")) {
+            char *id_tok = next_token(&pos, ' ');
+            char *sig_tok = next_token(&pos, ' ');
+            cmd_kill(id_tok, sig_tok);
         } else {
             sys_print("unknown command: ");
             sys_print(cmd);

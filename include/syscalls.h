@@ -30,6 +30,7 @@
 #define SYS_SIGNAL   14  // RDI = signal, RSI = ring-3 handler address (0 to restore the default), RDX = trampoline address; install a handler for this task. 0 or SYSCALL_ERROR. Does not block.
 #define SYS_KILL     15  // RDI = task id, RSI = signal; raise that signal on that task. 0 or SYSCALL_ERROR. Does not block.
 #define SYS_SIGRETURN 16 // no args; restore the context saved when a handler was delivered. NEVER RETURNS NORMALLY: the frame it restores resumes the interrupted instruction. Only the trampoline calls it.
+#define SYS_TASKS    18  // RDI = task_info_t buffer, RSI = size in bytes; fill it with one entry per live task and return the count. See include/taskinfo.h.
 #define SYS_SETFG    17  // RDI = pgid; make that process group the foreground, the one Ctrl-C is addressed to. 0 or SYSCALL_ERROR. Does not block.
 
 #endif
