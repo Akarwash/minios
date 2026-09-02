@@ -697,9 +697,7 @@ static char to_upper(char c) {
 // rejects is one TownOS cannot see at all, since long-filename entries are
 // skipped when a directory is walked.
 static int name_to_83(const char *name, char out[FAT32_NAME_LENGTH]) {
-    for (int i = 0; i < FAT32_NAME_LENGTH; i++) {
-        out[i] = ' ';
-    }
+    memset(out, ' ', FAT32_NAME_LENGTH);   // the 8.3 padding is spaces, not NULs
 
     int i = 0;
     int written = 0;
@@ -754,13 +752,9 @@ static void name_from_83(const uint8_t raw[FAT32_NAME_LENGTH],
 
 static int name_equals_83(const uint8_t raw[FAT32_NAME_LENGTH],
                           const char wanted[FAT32_NAME_LENGTH]) {
-    // Fixed-length and not NUL-terminated, so strcmp does not apply.
-    for (int i = 0; i < FAT32_NAME_LENGTH; i++) {
-        if ((char)raw[i] != wanted[i]) {
-            return 0;
-        }
-    }
-    return 1;
+    // Fixed-length and not NUL-terminated, so strcmp does not apply; memcmp is the
+    // compare for exactly this shape of field.
+    return memcmp(raw, wanted, FAT32_NAME_LENGTH) == 0;
 }
 
 // The start cluster is split across two 16-bit fields at opposite ends of the
@@ -814,9 +808,8 @@ static void fat32_name_sink_add(struct fat32_name_sink *sink, const char *name) 
     if (sink->used + len + 2 > sink->size) {
         return;
     }
-    for (uint32_t i = 0; i < len; i++) {
-        sink->buf[sink->used++] = name[i];
-    }
+    memcpy(sink->buf + sink->used, name, len);
+    sink->used += len;
     sink->buf[sink->used++] = '\n';
     sink->buf[sink->used] = '\0';   // valid C string after every append
     sink->count++;
@@ -1326,9 +1319,7 @@ static void fat32_fsinfo_invalidate(void) {
 
     // Both fields to 0xFFFFFFFF. That is eight contiguous 0xFF bytes covering the
     // free count at offset 488 and the next-free hint at 492.
-    for (int i = 0; i < 8; i++) {
-        block_buf[FAT32_FSINFO_FREE_COUNT_OFFSET + i] = 0xFF;
-    }
+    memset(block_buf + FAT32_FSINFO_FREE_COUNT_OFFSET, 0xFF, 8);
     disk_write(fs_fsinfo_block, 1, block_buf);   // best effort; a failure is harmless
 }
 
@@ -1501,9 +1492,7 @@ int fat32_write_file(const char *name, const void *buf, uint32_t len) {
     // no clock to stamp them with (see docs/decisions/0020-writable-fat32.md).
     struct fat32_dirent entry;
     memset(&entry, 0, sizeof(entry));
-    for (int i = 0; i < FAT32_NAME_LENGTH; i++) {
-        entry.name[i] = (uint8_t)name83[i];
-    }
+    memcpy(entry.name, name83, FAT32_NAME_LENGTH);
     entry.attr = FAT32_ATTR_ARCHIVE;
     entry.first_cluster_high = (uint16_t)(new_start >> 16);
     entry.first_cluster_low  = (uint16_t)(new_start & 0xFFFF);

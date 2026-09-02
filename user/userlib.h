@@ -19,12 +19,18 @@
 //   include/signals.h   the signal numbers
 //   include/usermem.h   the ring-3 address-space layout SYS_MMAP hands out from
 //   include/types.h     the fixed-width integer types and size_t
+// plus the two halves of libc that are compiled into every program as well as
+// into the kernel (see USER_LIBC_SOURCES in the Makefile):
+//   libc/string.h       strlen, strcmp, strcpy, strchr
+//   libc/mem.h          memcpy, memmove, memset, memcmp
 
 #include "../include/types.h"
 #include "../include/syscalls.h"
 #include "../include/vectors.h"
 #include "../include/signals.h"
 #include "../include/usermem.h"
+#include "../libc/string.h"
+#include "../libc/mem.h"
 
 // The raw doorbell. `int $SYSCALL_VECTOR` traps into the kernel's DPL 3 gate.
 // Convention (see include/syscalls.h): RAX = syscall number, RDI = first arg,
@@ -148,11 +154,7 @@ long sys_write_all(int fd, const char *buf, unsigned long len) {
 // this string" call sites read the same and cannot forget the loop.
 static inline __attribute__((always_inline))
 long sys_print(const char *s) {
-    unsigned long n = 0;
-    while (s[n] != '\0') {
-        n++;
-    }
-    return sys_write_all(1, s, n);
+    return sys_write_all(1, s, strlen(s));
 }
 
 // SYS_READ: read up to `len` bytes from descriptor `fd` into `buf`. Returns the

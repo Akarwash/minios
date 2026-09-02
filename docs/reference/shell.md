@@ -43,7 +43,7 @@ the shell before the syscall, because that failure is the user's and fixable by
 retyping — the one case worth telling apart from a disk error. See
 [decision 0020](../decisions/0020-writable-fat32.md).
 
-**Command names are case-SENSITIVE and filenames are not.** `str_eq` compares
+**Command names are case-SENSITIVE and filenames are not.** `strcmp` compares
 bytes, so `RUN a.elf` prints `unknown command: RUN`, while `run A.ELF` and
 `run a.elf` both work because the FAT32 layer uppercases the name before looking
 it up. This is only reachable now that shift exists (see

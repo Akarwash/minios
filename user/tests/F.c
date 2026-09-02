@@ -49,20 +49,16 @@ static void put5(char *dst, unsigned int n) {
 
 // Build one 64-byte line: "FTEST.TXT line NNNNN " then dots, then a newline as the
 // 64th byte. Fixed width so a human reading the file can see exactly which line is
-// which, and so the total is an exact multiple of the cluster size.
+// which, and so the total is an exact multiple of the cluster size. put5 stays
+// hand-rolled: printf has no field width, so it cannot zero-pad to five digits.
 static void fill_line(char *p, unsigned int lineno) {
     const char *prefix = "FTEST.TXT line ";
-    int i = 0;
-    while (prefix[i] != '\0') {
-        p[i] = prefix[i];
-        i++;
-    }
+    unsigned long i = strlen(prefix);
+    memcpy(p, prefix, i);
     put5(p + i, lineno);
     i += 5;
     p[i++] = ' ';
-    while (i < F_LINE - 1) {
-        p[i++] = '.';
-    }
+    memset(p + i, '.', (F_LINE - 1) - i);
     p[F_LINE - 1] = '\n';
 }
 

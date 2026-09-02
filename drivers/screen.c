@@ -21,7 +21,14 @@ static void scroll(void) {
     char *video = (char *)VIDEO_ADDRESS;
     int i;
 
-    memcpy(video, video + MAX_COLS * 2, MAX_COLS * (MAX_ROWS - 1) * 2);
+    // memmove, NOT memcpy: the source and destination overlap (every row moves up
+    // over the row above it). This used to be memcpy, and it worked only because
+    // the copy happens to run forward and the destination is BELOW the source, so
+    // each byte was read before anything overwrote it. That is an accident of one
+    // implementation, not a property of memcpy, whose contract says the ranges
+    // must not overlap; a memcpy that copied backward, or by words, would have
+    // scrolled garbage. memmove exists for exactly this case (libc/mem.c).
+    memmove(video, video + MAX_COLS * 2, MAX_COLS * (MAX_ROWS - 1) * 2);
 
     char *last_row = video + (MAX_ROWS - 1) * MAX_COLS * 2;
     for (i = 0; i < MAX_COLS; i++) {

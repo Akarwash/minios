@@ -65,26 +65,6 @@ static char file_buf[SHELL_FILE_MAX];
 // back (unsigned long)-1; name it here so the checks below read as intent.
 #define SYS_FAIL  ((unsigned long)-1)
 
-// A minimal string compare: the freestanding user program has no libc, so this is
-// hand-rolled. Returns 1 when the two NUL-terminated strings are equal.
-static int str_eq(const char *a, const char *b) {
-    while (*a != '\0' && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == *b;   // equal only if both reached '\0' at the same spot
-}
-
-// Length of a NUL-terminated string. `write` needs it to tell the kernel how many
-// bytes of the line to store, and there is no libc strlen to reach for.
-static unsigned long str_len(const char *s) {
-    unsigned long n = 0;
-    while (s[n] != '\0') {
-        n++;
-    }
-    return n;
-}
-
 // Is `name` expressible as an 8.3 name: a base of 1..8 characters, optionally a
 // dot and an extension of 0..3? This mirrors the kernel's name_to_83 acceptance
 // rule (lengths only; it does not judge individual characters), and it lives here
@@ -314,7 +294,7 @@ static void cmd_write(char *name, char *content) {
         sys_print(" is not an 8.3 name (max 8 chars, dot, 3 chars)\n");
         return;
     }
-    if (sys_writefile(name, content, str_len(content)) != 0) {
+    if (sys_writefile(name, content, strlen(content)) != 0) {
         sys_print("write: could not write ");
         sys_print(name);
         sys_print("\n");
@@ -495,18 +475,6 @@ static void read_line(void) {
     line[len] = '\0';
 }
 
-// Does the line contain a '|'? That is what routes it to the pipeline path; a line
-// with no '|' takes exactly the single-command path it always has.
-static int line_has_pipe(const char *s) {
-    while (*s != '\0') {
-        if (*s == '|') {
-            return 1;
-        }
-        s++;
-    }
-    return 0;
-}
-
 // Start one pipeline stage. A stage must be `run <file>` — the other commands are
 // shell builtins that write to the shell's own console rather than to a child, so
 // they cannot be a stage. `in_fd`/`out_fd` are the descriptors the child gets as its
@@ -515,7 +483,7 @@ static int line_has_pipe(const char *s) {
 static long start_segment(char *seg, int in_fd, int out_fd, unsigned long pgid) {
     char *pos = seg;
     char *cmd = next_token(&pos, ' ');
-    if (cmd == (char *)0 || !str_eq(cmd, "run")) {
+    if (cmd == (char *)0 || strcmp(cmd, "run") != 0) {
         sys_print("pipe: each stage must be 'run <file>'\n");
         return -1;
     }
@@ -698,7 +666,7 @@ void _start(void) {
         // single-command path below, unchanged. The single-command case is NOT routed
         // through the pipeline machinery, so a plain `run a.elf` still behaves exactly
         // as it did before pipes existed.
-        if (line_has_pipe(line)) {
+        if (strchr(line, '|') != NULL) {
             run_pipeline();
             continue;
         }
@@ -712,32 +680,32 @@ void _start(void) {
             continue;   // empty line (or only spaces): reprint the prompt
         }
 
-        if (str_eq(cmd, "list")) {
+        if (strcmp(cmd, "list") == 0) {
             cmd_list();
-        } else if (str_eq(cmd, "read")) {
+        } else if (strcmp(cmd, "read") == 0) {
             cmd_read(next_token(&pos, ' '));
-        } else if (str_eq(cmd, "write")) {
+        } else if (strcmp(cmd, "write") == 0) {
             // Extract the filename FIRST, then hand cmd_write the raw remainder as
             // the contents. Two statements, not one call: C leaves argument
             // evaluation order unspecified, and `pos` must be read only after
             // next_token has advanced it past the filename.
             char *wname = next_token(&pos, ' ');
             cmd_write(wname, pos);
-        } else if (str_eq(cmd, "delete")) {
+        } else if (strcmp(cmd, "delete") == 0) {
             cmd_delete(next_token(&pos, ' '));
-        } else if (str_eq(cmd, "free")) {
+        } else if (strcmp(cmd, "free") == 0) {
             cmd_free();
-        } else if (str_eq(cmd, "run")) {
+        } else if (strcmp(cmd, "run") == 0) {
             cmd_run(next_token(&pos, ' '));
-        } else if (str_eq(cmd, "help")) {
+        } else if (strcmp(cmd, "help") == 0) {
             print_help();
-        } else if (str_eq(cmd, "clear")) {
+        } else if (strcmp(cmd, "clear") == 0) {
             cmd_clear();
-        } else if (str_eq(cmd, "return")) {
+        } else if (strcmp(cmd, "return") == 0) {
             cmd_return(pos);   // the raw remainder after the "return" token
-        } else if (str_eq(cmd, "ps")) {
+        } else if (strcmp(cmd, "ps") == 0) {
             cmd_ps();
-        } else if (str_eq(cmd, "kill")) {
+        } else if (strcmp(cmd, "kill") == 0) {
             char *id_tok = next_token(&pos, ' ');
             char *sig_tok = next_token(&pos, ' ');
             cmd_kill(id_tok, sig_tok);
