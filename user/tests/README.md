@@ -194,12 +194,58 @@ means the stage downstream is gone and there is nothing left to do.
     20
     pipeline exited with status 0
 
+## J.ELF — the `SYS_MMAP` / `SYS_MUNMAP` abuse test
+
+Every other fixture asks the kernel for something it should grant. J asks for things
+it must **refuse**, and checks that each refusal changed nothing: a zero length, a
+length larger than the whole 2MB heap slot, a release of an address that was never
+mapped, a release of its own code and of its own stack, a release of the second page
+of a region, a release with the wrong length, a second release of a region already
+given back, a ninth region when eight is the cap, and a region that would cross the
+top of the slot. Between the abuses it does the ordinary thing (map, check the memory
+reads as zero, write a pattern, read it back, release), so "the kernel refused it" is
+distinguishable from "the kernel refuses everything". It exits **0** only if every
+call answered as `include/syscalls.h` promises, with a distinct non-zero status per
+check (listed at the top of `J.c`), and prints one line either way.
+
+    > run j.elf
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MMAP rejected: no free region slot
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    run: started j.elf
+    syscall: SYS_MMAP rejected a region that would cross the 2MB ceiling
+    syscall: SYS_MMAP rejected a region that would cross the 2MB ceiling
+    J: every abuse refused, every region released, memory intact
+    reap (wait):    task 2 exited (status 0), free frames: 30073, heap used: 1448
+    run: j.elf exited with status 0
+
+The kernel's `syscall: ... rejected` lines are the refusals, one per abuse, printed
+by the kernel exactly as it prints a rejected out-of-bounds buffer; that the shell's
+`run: started` line lands in the middle of them is scheduler timing. Two things to
+read out of the run. The program is still **running** after each refusal: a kernel
+that unmapped the code slot on request would take J down at its next instruction
+fetch, and one that accepted a 3MB request would strand frames or map over the
+kernel's half of the address space. And the free frame count comes back to the
+baseline `run a.elf` leaves, although the largest thing J maps is the entire slot
+(512 frames). J talks to the syscalls directly rather than through `malloc`, because
+`malloc` is built on this contract and cannot test it. See
+[user-memory.md](../../docs/reference/user-memory.md) and
+[decision 0024](../../docs/decisions/0024-user-memory-and-libc.md).
+
 ## Why every loop is bounded
 
 A program that never exits used to leave its parent blocked in `SYS_WAIT` with no way
 back short of a reboot, so `run <that program>` would make the shell permanently
-unusable. `A`–`F` therefore run a fixed number of rounds and call `sys_exit` at the
-bottom.
+unusable. `A`–`F` and `J` therefore run a fixed number of rounds and call `sys_exit` at
+the bottom.
 
 **Signals changed the stakes but not the rule.** Ctrl-C and `kill` can now stop a
 runaway task ([signals.md](../../docs/reference/signals.md)), so a bounded loop is a

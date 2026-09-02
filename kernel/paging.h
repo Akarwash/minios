@@ -48,7 +48,7 @@ address_space_t *paging_create_address_space(void);
 int paging_map_page(address_space_t *as, uint64_t virt, uint64_t phys, uint64_t flags);
 
 // Tear down an address space built by paging_create_address_space: return every
-// frame the task privately owns (its user pages, the page tables beneath the two
+// frame the task privately owns (its user pages, the page tables beneath the three
 // user PD slots, and its own PML4/PDPT/PD) to the frame pool, then kfree the
 // handle. After this the pointer is dangling and must not be used again.
 //
@@ -64,6 +64,22 @@ int paging_map_page(address_space_t *as, uint64_t virt, uint64_t phys, uint64_t 
 // It deliberately does NOT free the shared kernel mappings this tree points at:
 // see the comment in paging.c. Implemented in paging.c.
 void paging_destroy_address_space(address_space_t *as);
+
+// Map `length` bytes (whole pages, page-aligned) of fresh, ZEROED, user-writable
+// memory at `base` in `as`, one frame per page from alloc_frame. This is what
+// SYS_MMAP is built on. Returns 0 on success. On failure (out of frames, for a
+// page or for a page table) it returns -1 and has UNWOUND every page it mapped
+// before giving up, so a failed call costs the task nothing: see the comment at the
+// definition for what breaks without that (M3 in docs/decisions/0024).
+int paging_map_user_range(address_space_t *as, uint64_t base, uint64_t length);
+
+// The inverse: free the frame behind every present page in [base, base + length)
+// and clear its leaf entry, flushing each translation from the TLB. Pages that
+// were never mapped are skipped, which is what lets the map above unwind a partial
+// run with the same function. The page table itself stays in place (it is freed
+// with the tree by paging_destroy_address_space). This is what SYS_MUNMAP is
+// built on, after the region lookup that decides whether the caller may.
+void paging_unmap_user_range(address_space_t *as, uint64_t base, uint64_t length);
 
 // Load `as` into CR3, switching the active address space. Writing CR3 flushes the
 // TLB (we use no global pages), so stale translations are dropped automatically.

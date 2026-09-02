@@ -11,15 +11,20 @@
 // fault. The ONLY channel across the ring boundary is `int 0x50`, the syscall
 // gate, and this header is the whole of the user side of it.
 //
-// The two headers included below are the only things a user program is allowed
-// to lean on, and both are deliberately standalone (numbers only, no kernel
-// code, no types):
-//   include/syscalls.h  the syscall numbers (SYS_WRITE, SYS_EXIT)
+// The headers included below are the only things a user program is allowed to
+// lean on, and all of them are deliberately standalone (numbers and plain types
+// only, no kernel code):
+//   include/syscalls.h  the syscall numbers (SYS_WRITE, SYS_EXIT, ...)
 //   include/vectors.h   the vector to raise (SYSCALL_VECTOR)
+//   include/signals.h   the signal numbers
+//   include/usermem.h   the ring-3 address-space layout SYS_MMAP hands out from
+//   include/types.h     the fixed-width integer types and size_t
 
+#include "../include/types.h"
 #include "../include/syscalls.h"
 #include "../include/vectors.h"
 #include "../include/signals.h"
+#include "../include/usermem.h"
 
 // The raw doorbell. `int $SYSCALL_VECTOR` traps into the kernel's DPL 3 gate.
 // Convention (see include/syscalls.h): RAX = syscall number, RDI = first arg,
@@ -366,6 +371,36 @@ unsigned long sys_signal(int sig, void (*handler)(int)) {
 static inline __attribute__((always_inline))
 unsigned long sys_kill(unsigned long id, int sig) {
     return syscall2(SYS_KILL, id, (unsigned long)sig);
+}
+
+// SYS_MMAP: ask the kernel for `length` bytes of fresh memory. Returns the
+// page-aligned address of a new region inside the heap slot (USER_HEAP_BASE up to
+// USER_HEAP_LIMIT, include/usermem.h), or (unsigned long)-1. The memory is ZEROED
+// and mapped in full before the call returns (nothing is lazy), and `length` is
+// rounded up to whole pages, so asking for 100 bytes costs 4096. Anonymous memory
+// only: no file behind it, no sharing, no protection flags.
+//
+// A region is placed at the lowest address above every region this program still
+// holds. Space freed BELOW a live region is not reused in this rung, so a program
+// that keeps one region and maps and unmaps repeatedly above it climbs the 2MB slot
+// and eventually gets -1. Each program may hold at most eight regions at once. This
+// is the call malloc (libc/malloc.c) is built on; most programs never call it
+// directly. Does not block.
+static inline __attribute__((always_inline))
+unsigned long sys_mmap(unsigned long length) {
+    return syscall1(SYS_MMAP, length);
+}
+
+// SYS_MUNMAP: release a region SYS_MMAP handed out, and only that: `addr` must be
+// exactly the address SYS_MMAP returned and `length` the length asked of it (the
+// kernel rounds it up to pages the same way). Returns 0, or (unsigned long)-1 when
+// (addr, length) is not exactly a region this program holds: an address it never
+// mapped, its own code or stack, part of a region, or a region it already released.
+// A refused call changes nothing. There is no partial or overlapping unmap in this
+// rung. Does not block.
+static inline __attribute__((always_inline))
+unsigned long sys_munmap(unsigned long addr, unsigned long length) {
+    return syscall2(SYS_MUNMAP, addr, length);
 }
 
 // A crude busy-wait so the letters do not scroll past faster than the eye can

@@ -107,9 +107,9 @@ $(USER_TRAMPOLINE_OBJ): $(USER_TRAMPOLINE_SRC)
 USER_PROGRAMS = user/tests/A.ELF user/tests/B.ELF user/tests/C.ELF \
                 user/tests/D.ELF user/tests/E.ELF user/tests/F.ELF user/tests/G.ELF \
                 user/tests/COUNT.ELF user/tests/UPPER.ELF user/tests/H.ELF \
-                user/tests/ONCE.ELF user/SHELL.ELF
+                user/tests/ONCE.ELF user/tests/J.ELF user/SHELL.ELF
 
-user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h $(USER_TRAMPOLINE_OBJ)
+user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h include/usermem.h include/types.h $(USER_TRAMPOLINE_OBJ)
 	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
 
 # The kernel test fixtures. Same recipe; a separate rule because the source lives a
@@ -119,12 +119,12 @@ user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include
 # stem "tests/X"). Make resolves that by preferring the shorter stem, so this rule
 # wins, which is what we want: it is the one whose prerequisites name the right
 # source file.
-user/tests/%.ELF: user/tests/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h $(USER_TRAMPOLINE_OBJ)
+user/tests/%.ELF: user/tests/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h include/usermem.h include/types.h $(USER_TRAMPOLINE_OBJ)
 	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
 
 # The interactive shell. Same recipe as the pattern rule, but the target and source
 # names differ in case, so it is spelled out explicitly and portably.
-user/SHELL.ELF: user/shell.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h $(USER_TRAMPOLINE_OBJ)
+user/SHELL.ELF: user/shell.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h include/usermem.h include/types.h $(USER_TRAMPOLINE_OBJ)
 	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
 
 # Default target

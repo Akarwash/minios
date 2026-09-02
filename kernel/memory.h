@@ -5,32 +5,45 @@
 
 #define FRAME_SIZE 4096
 
-// The ring-3 program's code (4-6M) and stack (6-8M) physically occupy the low
-// end of the frame pool. See boot/boot.asm (PD[2]/PD[3]) and
-// user/user_program.c. memory_init() reserves these frames so the allocator
-// never hands out memory the running user program already lives on. They are
-// exposed here (not kept file-local to memory.c) so the syscall layer can reuse
-// them to bound-check untrusted pointers from ring 3.
-#define USER_REGION_START  0x400000         // 4 MB, ring-3 code (PD[2])
-#define USER_REGION_END    0x800000         // 8 MB, top of ring-3 stack (PD[3])
+// The ring-3 address space is three 2MB page-directory slots: code (PD[2], 4-6M),
+// stack (PD[3], 6-8M) and, since the user-memory rung, the heap (PD[4], 8-10M)
+// that SYS_MMAP fills one region at a time. The numbers live in include/usermem.h
+// because ring-3 code needs the same ones; these two are the kernel's historical
+// names for the code-and-stack span, kept because the ELF loader and the docs
+// reason in terms of them. memory_init() reserves the PHYSICAL frames under all
+// three slots (see the comment there for why the heap slot's frames must be
+// reserved too), and the syscall layer bounds untrusted ring-3 pointers against
+// the whole span with user_range_ok below.
+#include "../include/usermem.h"
+#define USER_REGION_START  USER_CODE_BASE    // 4 MB, ring-3 code (PD[2])
+#define USER_REGION_END    USER_STACK_LIMIT  // 8 MB, top of ring-3 stack (PD[3])
 
-// Is the whole range [ptr, ptr + len) inside the single ring-3 region? THE
+// Is the whole range [ptr, ptr + len) inside the ring-3 address space? THE
 // security boundary for every kernel path handed a pointer that came from ring 3,
 // whether to read a string out of it or to write a buffer through it. It bounds the
 // ENTIRE range rather than just the start, and it is careful about overflow: ptr +
 // len can wrap on a crafted length and a wrapped sum compares as comfortably small,
 // so len is checked against the room above ptr rather than by forming ptr + len.
 //
-// It lives here, beside the two constants it tests against, rather than in the
+// The upper bound is USER_SPACE_END, the top of the HEAP slot, not the top of the
+// stack: a buffer a program got from malloc has to be usable as a syscall buffer,
+// or malloc is only good for memory the program never shows the kernel. The check
+// is still region-based rather than per-page (it does not walk the caller's page
+// tables), so an address inside the span that is not mapped passes it and faults
+// in the kernel when dereferenced; that was already true of the unmapped middle of
+// the code slot, and the heap slot, which starts empty, makes such addresses more
+// common. See the limitation in docs/project-status.md.
+//
+// It lives here, beside the constants it tests against, rather than in the
 // syscall layer that used to own it, because kernel/signal.c needs the same check
 // on the same region: signal delivery writes a whole register frame through a stack
 // pointer that came from ring 3 (S4 in docs/decisions/0023-signals.md). Two
 // spellings of one security check is how one of them ends up subtly weaker.
 static inline int user_range_ok(uint64_t ptr, uint64_t len) {
-    if (ptr < USER_REGION_START || ptr >= USER_REGION_END) {
+    if (ptr < USER_REGION_START || ptr >= USER_SPACE_END) {
         return 0;
     }
-    return len <= USER_REGION_END - ptr;
+    return len <= USER_SPACE_END - ptr;
 }
 
 // Read the Multiboot memory map, extend the identity map to cover real RAM (up
