@@ -339,6 +339,12 @@ name in the root, so `run a.elf` finds them (the lookup is case-insensitive).
 | `H.ELF` | prints `H` 40 times, catches `SIG_INT` | 0 | a program that is interrupted and RESUMED, not killed |
 | `ONCE.ELF` | reads fd 0 once and exits | 0 | the reader that leaves early, so a writer gets `SIG_PIPE` |
 
+Four more fixtures are not in the table because their point is elsewhere: `F.ELF`,
+the multi-cluster write test, is self-checking and exits 0 only on an exact
+read-back; `G.ELF`, `COUNT.ELF` and `UPPER.ELF` exist to be joined by `|` (see
+[Pipelines](#pipelines) above). All four are described with their transcripts in
+[user/tests/README.md](../../user/tests/README.md).
+
 ### What `run d.elf` demonstrates
 
 D and E exist together to reach code that no other test can. In every ordinary
@@ -397,6 +403,46 @@ used:` to it invalidated every document quoting one, all at once and silently.
 Regenerate them from a real boot whenever those fields change, and paste what the
 machine prints rather than editing the old numbers into shape. The same examples
 appear in [`user/tests/README.md`](../../user/tests/README.md).
+
+### What `run h.elf` demonstrates
+
+H is the fixture for the other half of signals: a program that is interrupted and
+**put back**, rather than killed. It installs a `SIG_INT` handler, then prints forty
+`H`s with a delay between each. Press Ctrl-C while it runs, several times if you
+like: each press prints one `[H caught SIG_INT]` line, the `H`s carry on from exactly
+where they stopped, and at the end the program reports how many interrupts it caught
+and exits 0 — not 130, which is what the same key does to `run b.elf`, which has no
+handler.
+
+What is being tested is the resume, not the handler. Printing a line from a handler
+only shows that the kernel forged a call frame and jumped to it; the interesting half
+is the return. The handler's `ret` lands on the trampoline, the trampoline raises
+`SYS_SIGRETURN`, and the kernel copies the saved context back over the live register
+frame. If the run of `H`s came out short, or the final total did not match the number
+of presses, the restore would be wrong. See [signals.md](signals.md).
+
+### What `run g.elf | run once.elf` demonstrates
+
+ONCE is the downstream half of the `SIG_PIPE` test, and the whole program is that it
+does **not** drain its input. `G.ELF` writes 16384 bytes, four times the pipe's
+capacity, so it has to block and resume several times to finish; ONCE reads one
+bufferful, says how much arrived, and exits, which closes the last read end. G's next
+write finds no reader, the kernel raises `SIG_PIPE` on it, and the default action
+kills it with status 141 (128 + 13), so the pipeline ends instead of G spinning
+against a buffer nobody will ever drain. Before signals, that same run left G writing
+forever, and the only symptom was a prompt that never came back.
+
+```
+> run g.elf | run once.elf
+ONCE: read 64 bytes, exiting
+reap (wait):    task 5 exited (status 0), free frames: 30510, heap used: 5928
+reap (wait):    task 4 exited (status 141), free frames: 30585, heap used: 1192
+pipeline exited with status 0
+```
+
+The pipeline's own status is 0 because a pipeline reports its **last** stage's
+status, and ONCE exited normally; G's 141 is on its reap line. Captured output, like
+the transcript above: the free-frame and heap numbers are that boot's.
 
 ## Signals at the prompt
 

@@ -186,8 +186,17 @@ $(DISK_IMG):
 # not tidy: `run a.elf` would report the file as missing. A source-tree folder is the
 # only kind of folder this project has today, and giving the disk one needs
 # subdirectory support in the filesystem, which is a rung of its own.
+#
+# townos.bin IS A PREREQUISITE HERE, deliberately, even though the kernel is not
+# copied onto the disk. `make disk-programs` used to depend on the programs alone,
+# so a partial build (`make disk-programs` after editing kernel sources) refreshed
+# the programs on the image and left a STALE KERNEL in townos.bin. Booting that pairs
+# new programs with an old kernel, which produced one false-positive test result in
+# the signals rung: a fixture appeared to pass against kernel code that had not been
+# rebuilt. Naming the kernel here means any path that refreshes the disk rebuilds the
+# kernel first, so the image and the binary it boots with can never be out of step.
 .PHONY: disk-programs
-disk-programs: $(DISK_IMG) $(USER_PROGRAMS)
+disk-programs: townos.bin $(DISK_IMG) $(USER_PROGRAMS)
 	mcopy -o -i $(DISK_IMG) $(USER_PROGRAMS) ::/
 
 # ---------------------------------------------------------------------------

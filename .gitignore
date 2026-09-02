@@ -33,3 +33,6 @@ PIPE-FOLLOWUPS-TASK.md
 
 # Per-tranche scratch checklist for the signals rung, never committed.
 SIGNALS-TASK.md
+
+# Per-tranche scratch checklist for the libc rung, never committed.
+LIBC-TASK.md
