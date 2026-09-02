@@ -273,11 +273,47 @@ baseline `run a.elf` leaves, although the largest thing J maps is the entire slo
 [user-memory.md](../../docs/reference/user-memory.md) and
 [decision 0024](../../docs/decisions/0024-user-memory-and-libc.md).
 
+## K.ELF — the printf test
+
+One line per `printf` specifier, each with values chosen so the output can be
+checked against `K.c` by eye; and, because `printf` returns the number of bytes it
+wrote, every return value is compared with the length the line must have if every
+specifier did its job, so a wrong digit or a format that stopped early is a wrong
+count and a non-zero exit (1 + the index of the failing line). The last three lines
+are the failures `printf` is **designed** to have: `%q` is not a specifier it knows,
+so the format stops there, prints nothing for it and returns -1; and a `%s` given a
+pointer outside the ring-3 address space (a NULL, and 16) is refused before anything
+reads through it. The `%q` line is silenced from the compiler's own format check for
+that one line, which is the check that actually defends a program from a mismatched
+format (M5 in [decision 0024](../../docs/decisions/0024-user-memory-and-libc.md)).
+
+    > run k.elf
+    %d: 0 42 -42
+    %u: 0 4294967295
+    %x: 0 ff deadbeef
+    %s: hello
+    %c: ToS
+    100% done
+    mixed: answer=42, 2a, !%
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    stop here:
+    bad %s pointers:
+    bad %s pointers:
+    K: 11 lines checked
+    run: started k.elf
+    reap (wait):    task 1 exited (status 0), free frames: 30071, heap used: 1448
+    run: k.elf exited with status 0
+
+The 144-character line wraps at the screen's 80 columns; it is one `printf` call,
+longer than the 128-byte staging buffer, so the flush in the middle of a line is
+exercised as well as the one at the end.
+
 ## Why every loop is bounded
 
 A program that never exits used to leave its parent blocked in `SYS_WAIT` with no way
 back short of a reboot, so `run <that program>` would make the shell permanently
-unusable. `A`–`F`, `I` and `J` therefore run a fixed number of rounds and call `sys_exit` at
+unusable. `A`–`F` and `I`–`K` therefore run a fixed number of rounds and call `sys_exit` at
 the bottom.
 
 **Signals changed the stakes but not the rule.** Ctrl-C and `kill` can now stop a

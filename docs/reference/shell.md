@@ -274,11 +274,13 @@ reaches one the keyboard cannot (see [Signals at the prompt](#signals-at-the-pro
 below). The fixtures keep their bounded loops, which are now a convenience rather
 than a necessity.
 
-**Printing the status needs a number printer.** There is no libc and the only way
-out is `SYS_WRITE`, which takes a string, so `user/shell.c` has a small
-`print_uint` that builds the digits backwards into a stack buffer. Its `do`/`while`
-is deliberate: a plain `while (value)` prints nothing for zero, which is the most
-common status there is.
+**Printing the status uses `printf`.** The shell used to carry its own
+`print_uint`, ten call sites of a hand-built decimal conversion, because there was
+no libc to reach for, and three fixtures carried the same dozen lines again under
+another name. `printf` (`libc/printf.c`, linked into every program) replaced all
+four. It supports `%d %u %x %s %c %%` and nothing else, so an `unsigned long` size
+or count is cast to `unsigned int` at the call site. See
+[user-memory.md](user-memory.md).
 
 **The untrusted pointers.** Every pointer these take comes from ring 3 and is
 checked before the kernel touches it. Buffers go through `user_range_ok`, which

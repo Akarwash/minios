@@ -14,20 +14,6 @@
 
 #include "../userlib.h"
 
-// Print a non-negative number in decimal to fd 1. There is no libc, so the digits
-// are built by hand, least significant first, into the end of a buffer. The do/while
-// prints a single 0 for zero rather than nothing.
-static void print_ulong(unsigned long v) {
-    char buf[21];              // 20 digits is the most a 64-bit value needs, plus '\0'
-    int i = 20;
-    buf[i] = '\0';
-    do {
-        buf[--i] = (char)('0' + (v % 10));
-        v /= 10;
-    } while (v != 0);
-    sys_print(&buf[i]);
-}
-
 void _start(void) {
     char buf[256];
     unsigned long total = 0;
@@ -40,7 +26,8 @@ void _start(void) {
         total += (unsigned long)n;
     }
 
-    print_ulong(total);
-    sys_print("\n");
+    // The cast is because this printf has no %lu; a pipe's worth of bytes is far
+    // under 4GB.
+    printf("%u\n", (unsigned int)total);
     sys_exit(0);
 }

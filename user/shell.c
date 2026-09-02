@@ -116,30 +116,6 @@ static int name_is_83(const char *name) {
     return 1;
 }
 
-// Print a small non-negative number in decimal. There is no printf and no libc
-// here, and the only way out is sys_write, which takes a string: so the digits
-// have to be built by hand. Only exit statuses (0..255) go through this, but the
-// buffer is sized for the full range of an unsigned long anyway, because a buffer
-// sized for exactly the values you expect today is how this kind of helper gets
-// overflowed tomorrow.
-//
-// The digits come out least-significant first, so they are written backwards from
-// the end of the buffer and the pointer to the first one is returned. Note the
-// do/while: a plain `while (value)` would print nothing at all for zero, which is
-// the single most common status there is.
-static void print_uint(unsigned long value) {
-    char buf[21];              // 20 digits is the most an unsigned 64-bit value needs, plus '\0'
-    char *p = &buf[20];
-    *p = '\0';
-
-    do {
-        *--p = (char)('0' + (value % 10));
-        value /= 10;
-    } while (value != 0);
-
-    sys_print(p);
-}
-
 static void print_help(void) {
     // The command names are TownOS's own and deliberately not the Unix ones.
     sys_print("commands:\n");
@@ -201,29 +177,23 @@ static void cmd_ps(void) {
         return;
     }
 
-    sys_print("  id  parent  pgid  state    status\n");
+    printf("  id  parent  pgid  state    status\n");
     for (unsigned long i = 0; i < n; i++) {
-        sys_print("  ");
-        print_uint(tasks[i].id);
-        sys_print("   ");
+        printf("  %u   ", tasks[i].id);
         // A task nobody started has no parent to name. The kernel's sentinel for that
         // is 0xFFFFFFFF, which printed as a number is nine digits of noise.
         if (tasks[i].parent_id == 0xFFFFFFFFu) {
-            sys_print("-");
+            printf("-");
         } else {
-            print_uint(tasks[i].parent_id);
+            printf("%u", tasks[i].parent_id);
         }
-        sys_print("       ");
-        print_uint(tasks[i].pgid);
-        sys_print("     ");
-        sys_print(state_name(tasks[i].state));
+        printf("       %u     %s", tasks[i].pgid, state_name(tasks[i].state));
         // Only a zombie has a status worth printing; for anything else the field is 0
         // and means nothing at all.
         if (tasks[i].state == TASK_INFO_ZOMBIE) {
-            sys_print("   ");
-            print_uint((unsigned long)tasks[i].exit_status);
+            printf("   %d", tasks[i].exit_status);
         }
-        sys_print("\n");
+        printf("\n");
     }
 }
 
@@ -301,13 +271,10 @@ static void cmd_read(char *name) {
     // "showing the first N bytes" notice, which only ever fired for a file of
     // exactly the buffer size, which is complete (TODO(read-truncation), now gone).
     if (size > sizeof(file_buf) - 1) {
-        sys_print("read: ");
-        sys_print(name);
-        sys_print(" is ");
-        print_uint(size);
-        sys_print(" bytes, the buffer holds ");
-        print_uint(sizeof(file_buf) - 1);
-        sys_print("\n");
+        // The casts are because this printf has no length modifiers (%lu): a file
+        // on a 64MB volume is well under 4GB, so an unsigned int holds either number.
+        printf("read: %s is %u bytes, the buffer holds %u\n", name,
+               (unsigned int)size, (unsigned int)(sizeof(file_buf) - 1));
         return;
     }
 
@@ -361,8 +328,7 @@ static void cmd_write(char *name, char *content) {
 // count drifting down. fat32_free_count recounts the whole FAT, so it is honest
 // rather than a cached total that a leak could hide behind.
 static void cmd_free(void) {
-    print_uint(sys_freecount());
-    sys_print(" clusters free\n");
+    printf("%u clusters free\n", (unsigned int)sys_freecount());
 }
 
 // `delete <file>`: remove a file from the disk.
@@ -442,11 +408,7 @@ static void cmd_run(char *name) {
         return;
     }
 
-    sys_print("run: ");
-    sys_print(name);
-    sys_print(" exited with status ");
-    print_uint((unsigned long)status);
-    sys_print("\n");
+    printf("run: %s exited with status %d\n", name, (int)status);
 }
 
 static void cmd_clear(void) {
@@ -682,9 +644,7 @@ drain:
             }
         }
         if (last_id >= 0 && last_status >= 0) {
-            sys_print("pipeline exited with status ");
-            print_uint((unsigned long)last_status);
-            sys_print("\n");
+            printf("pipeline exited with status %d\n", (int)last_status);
         }
     }
 

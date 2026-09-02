@@ -107,7 +107,8 @@ $(USER_TRAMPOLINE_OBJ): $(USER_TRAMPOLINE_SRC)
 USER_PROGRAMS = user/tests/A.ELF user/tests/B.ELF user/tests/C.ELF \
                 user/tests/D.ELF user/tests/E.ELF user/tests/F.ELF user/tests/G.ELF \
                 user/tests/COUNT.ELF user/tests/UPPER.ELF user/tests/H.ELF \
-                user/tests/ONCE.ELF user/tests/J.ELF user/tests/I.ELF user/SHELL.ELF
+                user/tests/ONCE.ELF user/tests/J.ELF user/tests/I.ELF user/tests/K.ELF \
+                user/SHELL.ELF
 
 # ---------------------------------------------------------------------------
 # The ring-3 half of libc
@@ -122,9 +123,11 @@ USER_PROGRAMS = user/tests/A.ELF user/tests/B.ELF user/tests/C.ELF \
 #
 # The two sets of objects can never be confused: the kernel's are `.o` and are
 # built with -mcmodel=kernel, which would not even link at 0x400000; these are
-# `.user.o` and built with -mcmodel=small. libc/malloc.c is ring-3 only (it sits
-# on SYS_MMAP; the kernel's copy of the same allocator is kernel/heap.c).
-USER_LIBC_SOURCES = libc/mem.c libc/string.c libc/malloc.c
+# `.user.o` and built with -mcmodel=small. libc/malloc.c and libc/printf.c are
+# ring-3 only (malloc sits on SYS_MMAP, and the kernel's copy of the same allocator
+# is kernel/heap.c; printf sits on SYS_WRITE, and the kernel prints through the
+# screen driver).
+USER_LIBC_SOURCES = libc/mem.c libc/string.c libc/malloc.c libc/printf.c
 USER_LIBC_OBJECTS = $(USER_LIBC_SOURCES:.c=.user.o)
 USER_HEADERS = user/userlib.h include/syscalls.h include/vectors.h include/signals.h \
                include/usermem.h include/types.h libc/mem.h libc/string.h

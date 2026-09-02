@@ -122,27 +122,37 @@ long sys_write(int fd, const char *buf, unsigned long len) {
     return (long)syscall3(SYS_WRITE, (unsigned long)fd, (unsigned long)buf, len);
 }
 
-// Print a NUL-terminated string to fd 1 (standard output), looping until the whole
-// string is written. THE LOOP IS THE POINT: sys_write may move fewer bytes than
-// asked, so one call is never assumed to have moved everything. Returns the number
-// of bytes written (short only if the descriptor went away mid-write). This is the
-// replacement for the old single-argument sys_write, so the common "print this
-// string" call sites read the same and cannot forget the loop.
+// Write all `len` bytes of `buf` to `fd`, looping until everything is written.
+// THE LOOP IS THE POINT: sys_write may move fewer bytes than asked (a pipe takes
+// only what fits; the console moves at most the kernel's staging buffer per call),
+// so one call is never assumed to have moved everything. Returns the number of
+// bytes written, short only if the descriptor went away mid-write (a write
+// returning <= 0), which is the one reason to stop. sys_print and printf are both
+// built on this one loop, so neither can forget it.
 static inline __attribute__((always_inline))
-long sys_print(const char *s) {
-    unsigned long n = 0;
-    while (s[n] != '\0') {
-        n++;
-    }
+long sys_write_all(int fd, const char *buf, unsigned long len) {
     unsigned long done = 0;
-    while (done < n) {
-        long w = sys_write(1, s + done, n - done);
+    while (done < len) {
+        long w = sys_write(fd, buf + done, len - done);
         if (w <= 0) {
             return (long)done;   // far end gone or error: stop, report progress
         }
         done += (unsigned long)w;
     }
     return (long)done;
+}
+
+// Print a NUL-terminated string to fd 1 (standard output), looping until the whole
+// string is written (see sys_write_all). Returns the number of bytes written. This
+// is the replacement for the old single-argument sys_write, so the common "print
+// this string" call sites read the same and cannot forget the loop.
+static inline __attribute__((always_inline))
+long sys_print(const char *s) {
+    unsigned long n = 0;
+    while (s[n] != '\0') {
+        n++;
+    }
+    return sys_write_all(1, s, n);
 }
 
 // SYS_READ: read up to `len` bytes from descriptor `fd` into `buf`. Returns the
@@ -430,6 +440,31 @@ unsigned long sys_munmap(unsigned long addr, unsigned long length) {
 void *malloc(size_t size);
 void  free(void *ptr);
 void *calloc(size_t count, size_t size);
+
+// ============================================================================
+// printf (libc/printf.c, linked into every program).
+// ============================================================================
+// Formatted output to fd 1. Six specifiers and nothing else: %d (int), %u
+// (unsigned int), %x (unsigned int, lowercase hex, no prefix), %s (a NUL-terminated
+// string), %c (a character), %% (a percent sign). No width, no precision, no
+// length modifiers, no floats; more get added when something needs them. Returns
+// the number of bytes written, or -1.
+//
+// An unrecognised specifier STOPS THE FORMAT: what came before it is written,
+// nothing after it is, and the call returns -1. It is neither printed raw nor
+// skipped. A %s whose pointer lies outside the ring-3 address space is refused the
+// same way, before anything reads through it. Output goes through sys_write_all,
+// so a long line into a full pipe waits rather than truncates.
+//
+// THE FORMAT ATTRIBUTE IS THE REAL DEFENCE against a format string that does not
+// match its arguments, which cannot be detected at run time (printf("%s %s", one)
+// reads a second argument that was never passed): the compiler checks every call
+// site against the format string and warns on a mismatch. A mismatched format that
+// gets past it is undefined behaviour. Two edges the compiler cannot flag, because
+// they are valid for the standard printf: a length modifier (%lu, %ld) is not a
+// specifier this printf knows, so it stops the format at run time; cast the value to
+// unsigned int or int at the call site instead. And %p does not exist here.
+int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // A crude busy-wait so the letters do not scroll past faster than the eye can
 // follow. This is NOT a timed delay, just a spin; the count was tuned by eye
