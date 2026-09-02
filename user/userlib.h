@@ -403,6 +403,34 @@ unsigned long sys_munmap(unsigned long addr, unsigned long length) {
     return syscall2(SYS_MUNMAP, addr, length);
 }
 
+// ============================================================================
+// The heap: malloc, free, calloc (libc/malloc.c, linked into every program).
+// ============================================================================
+// A program can ask for memory at runtime instead of declaring every buffer as a
+// fixed static array. The allocator is kernel/heap.c ported a second time (the
+// same p5 explicit free list with boundary tags and coalescing), sitting on
+// SYS_MMAP instead of the frame allocator. The first call maps a 64KB slab at the
+// bottom of the heap slot; running out maps another, adjacent, slab, up to the
+// kernel's eight-region cap; a slab is never given back until the program exits.
+//
+// Contract, and its edges:
+//   - malloc(n) returns 8-byte aligned memory that holds n bytes, or NULL when the
+//     kernel refuses another slab (out of frames, out of region slots, or the 2MB
+//     ceiling). A fresh slab arrives zeroed from the kernel, but a REUSED block
+//     holds whatever its last owner left: use calloc if zero matters.
+//   - free(p) returns a block to the allocator, coalescing with its neighbours;
+//     free(NULL) does nothing. Freeing anything malloc did not return, or freeing
+//     twice, corrupts the heap (the allocator prints one ERROR line for the cases
+//     it can detect and does nothing for the rest).
+//   - calloc(count, size) is malloc(count * size) with the product checked for
+//     overflow and the memory cleared.
+//   - There is no realloc in this rung.
+//   - Not async-signal-safe: a signal handler must not call any of these.
+// See libc/malloc.c, docs/reference/user-memory.md and docs/decisions/0024.
+void *malloc(size_t size);
+void  free(void *ptr);
+void *calloc(size_t count, size_t size);
+
 // A crude busy-wait so the letters do not scroll past faster than the eye can
 // follow. This is NOT a timed delay, just a spin; the count was tuned by eye
 // under QEMU for a readable interleave. A real system would sleep, not spin.

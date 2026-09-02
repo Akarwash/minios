@@ -194,6 +194,39 @@ means the stage downstream is gone and there is nothing left to do.
     20
     pipeline exited with status 0
 
+## I.ELF — the malloc test
+
+The first program that asks for memory at runtime. It `malloc`s 300 blocks of
+sizes from 1 to 1400 bytes (about 210KB in all, so the heap has to grow past its
+first 64KB slab several times), checks each is 8-byte aligned, writes a pattern
+into each that depends on the block **and** the byte offset, and only then verifies
+every pattern, so a block that overlaps another has already had its pattern
+overwritten by the time the check runs. It frees them in a fixed shuffled order,
+then asks for one 200000-byte block, which fits only if every freed block coalesced
+back into one span **across the slab boundaries**, and which must come back at the
+address of the very first block (first-fit on a heap that is one free block again).
+Then `calloc` on that reused memory, which must be zero, and a 3MB request, which
+must fail with NULL rather than anything louder. It exits **0** only if every check
+passes, with a distinct non-zero status per failure mode (listed at the top of
+`I.c`), and prints one line either way.
+
+    > run i.elf
+    run: started i.elf
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    malloc: heap grow: SYS_MMAP refused another slab
+    I: 300 blocks allocated, verified, freed in shuffled order, and reused
+    reap (wait):    task 2 exited (status 0), free frames: 30071, heap used: 1448
+    run: i.elf exited with status 0
+
+The two lines before the verdict are the 3MB request being refused: the kernel says
+why it declined the slab, malloc says it gave up, and malloc returns NULL, which is
+the outcome being tested. **The reap line is the other half of the test.** malloc
+never gives a slab back, so this program exits holding four slabs it asked for at
+runtime; ten consecutive runs must print the same free frame count and the same
+`heap used` every time, and a count that steps down by a few slabs per run means
+the address-space teardown is not freeing the heap slot with the rest (M2 in
+[decision 0024](../../docs/decisions/0024-user-memory-and-libc.md)).
+
 ## J.ELF — the `SYS_MMAP` / `SYS_MUNMAP` abuse test
 
 Every other fixture asks the kernel for something it should grant. J asks for things
@@ -244,7 +277,7 @@ baseline `run a.elf` leaves, although the largest thing J maps is the entire slo
 
 A program that never exits used to leave its parent blocked in `SYS_WAIT` with no way
 back short of a reboot, so `run <that program>` would make the shell permanently
-unusable. `A`–`F` and `J` therefore run a fixed number of rounds and call `sys_exit` at
+unusable. `A`–`F`, `I` and `J` therefore run a fixed number of rounds and call `sys_exit` at
 the bottom.
 
 **Signals changed the stakes but not the rule.** Ctrl-C and `kill` can now stop a

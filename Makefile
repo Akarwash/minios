@@ -107,10 +107,33 @@ $(USER_TRAMPOLINE_OBJ): $(USER_TRAMPOLINE_SRC)
 USER_PROGRAMS = user/tests/A.ELF user/tests/B.ELF user/tests/C.ELF \
                 user/tests/D.ELF user/tests/E.ELF user/tests/F.ELF user/tests/G.ELF \
                 user/tests/COUNT.ELF user/tests/UPPER.ELF user/tests/H.ELF \
-                user/tests/ONCE.ELF user/tests/J.ELF user/SHELL.ELF
+                user/tests/ONCE.ELF user/tests/J.ELF user/tests/I.ELF user/SHELL.ELF
 
-user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h include/usermem.h include/types.h $(USER_TRAMPOLINE_OBJ)
-	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
+# ---------------------------------------------------------------------------
+# The ring-3 half of libc
+# ---------------------------------------------------------------------------
+# libc/ is compiled TWICE. The kernel build compiles libc/mem.c and libc/string.c
+# with the kernel flags (they are in C_SOURCES above). The user build compiles the
+# same files, plus the ring-3-only ones, with USER_CFLAGS into separate `.user.o`
+# objects and links them into every program. A program is a single translation
+# unit plus these objects plus the trampoline, and nothing else; it used to be the
+# translation unit alone, which is why every fixture grew its own number printer
+# and the shell its own string compare.
+#
+# The two sets of objects can never be confused: the kernel's are `.o` and are
+# built with -mcmodel=kernel, which would not even link at 0x400000; these are
+# `.user.o` and built with -mcmodel=small. libc/malloc.c is ring-3 only (it sits
+# on SYS_MMAP; the kernel's copy of the same allocator is kernel/heap.c).
+USER_LIBC_SOURCES = libc/mem.c libc/string.c libc/malloc.c
+USER_LIBC_OBJECTS = $(USER_LIBC_SOURCES:.c=.user.o)
+USER_HEADERS = user/userlib.h include/syscalls.h include/vectors.h include/signals.h \
+               include/usermem.h include/types.h libc/mem.h libc/string.h
+
+libc/%.user.o: libc/%.c $(USER_HEADERS)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+user/%.ELF: user/%.c $(USER_HEADERS) $(USER_LD_SCRIPT) $(USER_TRAMPOLINE_OBJ) $(USER_LIBC_OBJECTS)
+	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ) $(USER_LIBC_OBJECTS)
 
 # The kernel test fixtures. Same recipe; a separate rule because the source lives a
 # directory down and the prerequisite path has to say so.
@@ -119,13 +142,13 @@ user/%.ELF: user/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include
 # stem "tests/X"). Make resolves that by preferring the shorter stem, so this rule
 # wins, which is what we want: it is the one whose prerequisites name the right
 # source file.
-user/tests/%.ELF: user/tests/%.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h include/usermem.h include/types.h $(USER_TRAMPOLINE_OBJ)
-	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
+user/tests/%.ELF: user/tests/%.c $(USER_HEADERS) $(USER_LD_SCRIPT) $(USER_TRAMPOLINE_OBJ) $(USER_LIBC_OBJECTS)
+	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ) $(USER_LIBC_OBJECTS)
 
 # The interactive shell. Same recipe as the pattern rule, but the target and source
 # names differ in case, so it is spelled out explicitly and portably.
-user/SHELL.ELF: user/shell.c user/userlib.h $(USER_LD_SCRIPT) include/syscalls.h include/vectors.h include/signals.h include/usermem.h include/types.h $(USER_TRAMPOLINE_OBJ)
-	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ)
+user/SHELL.ELF: user/shell.c $(USER_HEADERS) $(USER_LD_SCRIPT) $(USER_TRAMPOLINE_OBJ) $(USER_LIBC_OBJECTS)
+	$(CC) $(USER_CFLAGS) $(USER_LDFLAGS) -o $@ $< $(USER_TRAMPOLINE_OBJ) $(USER_LIBC_OBJECTS)
 
 # Default target
 all: townos.bin $(USER_PROGRAMS)
@@ -268,5 +291,5 @@ run: townos.bin disk-programs disk-testfiles
 # `make run` writes it again. The COPY of it already on the disk image stays, along
 # with everything else there, because the image is not build output.
 clean:
-	rm -f $(ALL_OBJECTS) townos.bin townos.elf $(USER_PROGRAMS) $(DISK_TESTFILES) $(USER_TRAMPOLINE_OBJ)
+	rm -f $(ALL_OBJECTS) townos.bin townos.elf $(USER_PROGRAMS) $(DISK_TESTFILES) $(USER_TRAMPOLINE_OBJ) $(USER_LIBC_OBJECTS)
 	rm -f user/A.ELF user/B.ELF user/C.ELF user/user_program.o

@@ -1,30 +1,59 @@
-// heap.c: kernel heap, ported from the CMSC216 p5 el_malloc (an explicit
-// free-list allocator with boundary tags and coalescing).
+// malloc.c: the ring-3 heap, ported from kernel/heap.c, which was itself ported
+// from the CMSC216 p5 el_malloc (an explicit free-list allocator with boundary
+// tags and coalescing).
 //
-// THIS CODE HAS BEEN PORTED TWICE, AND THE TWO COPIES ARE MEANT TO STAY THE SAME.
-// libc/malloc.c is this file again, in ring 3, with SYS_MMAP where
-// alloc_frames_contiguous is below and no interrupt guard; the block layout, the
-// lists, the search, the split, the coalesce and every function name are identical
-// so that a bug found in one copy can be looked for in the other by name, and so
-// the two can be diffed. A fix that lands here and not there (or the reverse) is
-// the failure that comment and this one exist to prevent. The differences, each
-// forced by the ring the copy runs in, are enumerated at the top of libc/malloc.c.
+// THIS IS THE SAME CODE AS kernel/heap.c, ON PURPOSE. Porting an allocator is the
+// second-cheapest way to get one, and this is the second port of the same one:
+// chapter 13 moved p5's el_malloc into the kernel and changed only where it got
+// memory from; this file moves it into ring 3 and changes only that again. The
+// block layout, the two lists, the first-fit search, the split, the coalesce and
+// every function name are unchanged, so that a bug found in one file can be
+// looked for in the other by name, and so the two can be diffed. Keep it that way:
+// a fix that lands in one copy and not the other is the failure this comment
+// exists to prevent. The matching comment is at the top of kernel/heap.c.
 //
-// The algorithm is the original author's, unchanged. Only three things differ
-// from the p5 source, all forced by running in a kernel rather than a process:
-//   1. The slab comes from the frame allocator (alloc_frames_contiguous), not
-//      mmap, and lives at whatever physical frames it returns, not a fixed
-//      virtual address. el_ctl is a plain .bss struct, not an mmap'd page.
-//   2. There is no libc: printf/fprintf become the VGA print_string, assert and
-//      the mmap-return checks are gone.
-//   3. kmalloc/kfree add an interrupt-disable guard: the free list is shared
-//      mutable state and the timer IRQ (100 Hz) could land mid-relink.
+// What differs from the kernel copy, all forced by running in ring 3 rather than
+// in the kernel, and each marked at the site:
+//   1. The slab comes from SYS_MMAP, not alloc_frames_contiguous, and lives at
+//      whatever address the kernel returns: the bottom of the heap slot for the
+//      first slab and upwards from there. Growth checks that the new slab is
+//      ADJACENT to the old one, exactly as the kernel copy does, and gives a
+//      non-adjacent slab straight back with SYS_MUNMAP rather than splice it in.
+//      See el_append_pages_to_heap for why that check is the whole safety of the
+//      walk, and the note on multiple slabs.
+//   2. There is no interrupt guard. The kernel copy wraps kmalloc/kfree in
+//      irq_save/irq_restore because a timer interrupt could call kmalloc in the
+//      middle of a relink; ring 3 cannot mask interrupts and does not need to,
+//      because preemption switches to another task with its own heap, never back
+//      into this program's lists. The hazard that DOES exist is a signal handler
+//      calling malloc while malloc is half way through a relink. Nothing here
+//      prevents it: malloc is not async-signal-safe, and a handler must not call it.
+//   3. No print_string: the one error message goes through sys_print. The stats
+//      and debug printers (heap_print_stats, el_print_*) and heap_used_bytes were
+//      not ported; they need printf, which lives beside this file and must not be
+//      something the allocator depends on (see M6 below).
+//   4. free(NULL) is a no-op, as C requires. The p5 el_free treats NULL as an error
+//      and the kernel copy kept that; here the public wrapper filters it and the
+//      el_free core is unchanged.
+//   5. The public malloc rounds each request up to a multiple of 8, so every
+//      payload is 8-byte aligned (the slab is page aligned and the block overhead
+//      is a multiple of 8). The p5 core and kmalloc round nothing and hand out
+//      whatever alignment the previous sizes left. 8, not the 16 that C's
+//      max_align_t asks for: enough for every integer and pointer store, not for
+//      aligned SSE loads. Recorded in docs/decisions/0024.
+//   6. M6, THE FIRST CALL. malloc initialises the heap itself on its first call,
+//      from a static `initialised` flag, rather than from an init function a
+//      program has to remember to call. The slab path below touches NOTHING that
+//      allocates: the first block's header and footer are written directly, and
+//      the flag is set before the block is built, not after. See malloc().
 //
-// See docs/reference/heap.md and docs/decisions/0010-kernel-heap-ported-from-p5.md.
+// Slabs are NEVER returned to the kernel. free puts a block back on the
+// available list; nothing ever calls SYS_MUNMAP on a slab, so a program's peak
+// heap is held until it exits, when paging_destroy_address_space frees the whole
+// slot. See docs/reference/user-memory.md.
 
-#include "heap.h"
-#include "memory.h"
-#include "../drivers/screen.h"
+#include "../user/userlib.h"   // sys_mmap, sys_munmap, sys_print, and the malloc/free/calloc prototypes
+#include "mem.h"               // memset, for calloc
 
 // ============================================================================
 // Pointer arithmetic macros (verbatim from the p5 source).
@@ -37,14 +66,21 @@
 // and a # of bytes (usually size_t)
 #define PTR_MINUS_BYTES(ptr,off) ((void *) (((size_t) (ptr)) - ((size_t) (off))))
 
-// The heap page size equals the frame allocator's frame size: the slab is built
-// out of whole frames.
-#define EL_PAGE_BYTES FRAME_SIZE
+// The heap page size is the kernel's mapping granularity: SYS_MMAP rounds every
+// request up to it, so a slab is always whole pages.
+#define EL_PAGE_BYTES USER_PAGE_SIZE
 
-// Initial slab (16 pages = 64KB) and the default growth chunk. The heap grows
-// on demand when a request does not fit; growth is at least this many pages.
+// Initial slab (16 pages = 64KB, the kernel heap's figure) and the default growth
+// chunk. The heap grows on demand when a request does not fit; growth is at least
+// this many pages. Each growth is one SYS_MMAP region, and a task may hold at most
+// MAX_REGIONS (8) of them, so with this chunk the heap can grow seven times: 512KB
+// in all, unless a single request forces a larger chunk. That cap is a consequence
+// of the kernel's fixed region array and is recorded in docs/decisions/0024.
 #define HEAP_INITIAL_PAGES 16
 #define HEAP_GROW_PAGES    16
+
+// What SYS_MMAP returns when it refuses.
+#define MMAP_FAILED ((void *)(unsigned long)-1)
 
 // defines to indicate if a block is available or used
 #define EL_AVAILABLE     'a'    // block state indicating available
@@ -85,60 +121,16 @@ typedef struct {
   el_blocklist_t *used;         // pointer to used_actual
 } el_ctl_t;
 
-// The control block is a fixed-size struct: no reason to allocate it. In the p5
-// source it was mmap'd at a fixed address; here it lives in .bss (zero-init) and
-// el_ctl points at it, so all the el_ctl-> code below comes over untouched.
+// The control block is a fixed-size struct: no reason to allocate it, and (M6)
+// every reason not to. In the p5 source it was mmap'd at a fixed address; here, as
+// in the kernel, it lives in .bss (zero-init) and el_ctl points at it, so all the
+// el_ctl-> code below comes over untouched.
 static el_ctl_t el_ctl_actual;
 static el_ctl_t *el_ctl = &el_ctl_actual;
 
-// ============================================================================
-// Interrupt-safety guard.
-// ============================================================================
-// The available/used lists are shared mutable state. The timer fires 100x/sec,
-// and its handler (or the scheduler it drives) could call kmalloc while another
-// kmalloc is halfway through relinking the list, which corrupts it. kmalloc and
-// kfree therefore disable interrupts across their critical section.
-//
-// This is SAVE-and-RESTORE, not an unconditional sti: kmalloc/kfree may be
-// called from inside an interrupt handler where interrupts are already off, and
-// forcing them back on there would re-enter the very code we are protecting.
-static inline uint64_t irq_save(void) {
-    uint64_t flags;
-    __asm__ __volatile__("pushfq\n\t"
-                         "pop %0\n\t"
-                         "cli"
-                         : "=r"(flags) : : "memory");
-    return flags;
-}
-
-static inline void irq_restore(uint64_t flags) {
-    __asm__ __volatile__("push %0\n\t"
-                         "popfq"
-                         : : "r"(flags) : "memory", "cc");
-}
-
-// ============================================================================
-// Kernel-native print helpers (replace the p5 printf/fprintf).
-// ============================================================================
-static void print_dec(uint64_t n) {
-    char buf[21];               // 2^64 is 20 digits
-    int i = 0;
-    if (n == 0) {
-        print_char('0');
-        return;
-    }
-    while (n > 0) {
-        buf[i++] = '0' + (char)(n % 10);
-        n /= 10;
-    }
-    while (i > 0) {
-        print_char(buf[--i]);
-    }
-}
-
-// print_hex used to be a second static copy right here. It now lives in the
-// screen driver (drivers/screen.c) because the ELF loader needed the same thing,
-// and two identical hex printers in one kernel is one too many.
+// Has the first slab been built? Set INSIDE the slab path, before the first block
+// is written, and never cleared. See malloc() for why the order matters (M6).
+static int initialised = 0;
 
 // ============================================================================
 // Boundary-tag address arithmetic (verbatim from the p5 source).
@@ -265,7 +257,7 @@ void *el_malloc(size_t nbytes){
 }
 
 // ============================================================================
-// Free and coalesce (verbatim core from p5; only the error printf is native).
+// Free and coalesce (verbatim core from p5; only the error message is native).
 // ============================================================================
 
 void el_merge_block_with_above(el_blockhead_t *lower){
@@ -292,12 +284,12 @@ void el_merge_block_with_above(el_blockhead_t *lower){
 
 void el_free(void *ptr){
   if (ptr == NULL){ //inavlid pointer check
-    print_string("ERROR: el_free() not called on an EL_USED block\n");
+    sys_print("ERROR: el_free() not called on an EL_USED block\n");
     return;
   }
   el_blockhead_t *block = (el_blockhead_t *) PTR_MINUS_BYTES(ptr, sizeof(el_blockhead_t)); //comvert to block pointer
   if (block->state != EL_USED||block->state=='\0') { //check if it is used
-    print_string("ERROR: el_free() not called on an EL_USED block\n");
+    sys_print("ERROR: el_free() not called on an EL_USED block\n");
     return;
   }
   el_remove_block(el_ctl->used, block);
@@ -309,26 +301,40 @@ void el_free(void *ptr){
 }
 
 // ============================================================================
-// Slab construction and growth: mmap becomes alloc_frames_contiguous.
+// Slab construction and growth: alloc_frames_contiguous becomes SYS_MMAP.
 // ============================================================================
 
 // Build the initial slab and its single free block. The p5 source mmap'd a page
-// for el_ctl and a slab at a fixed address; here el_ctl is static and the slab
-// is whatever contiguous run of frames the allocator returns.
-static int el_init(uint64_t initial_heap_size){
-  uint32_t npages = (uint32_t)(initial_heap_size / EL_PAGE_BYTES);
-  void *heap = (void *) alloc_frames_contiguous(npages);
-  if(heap == NULL){
-    print_string("el_init: could not get initial slab from frame allocator\n");
+// for el_ctl and a slab at a fixed address; the kernel copy took a contiguous run
+// of frames; here the slab is whatever region SYS_MMAP returns, which for the
+// first call of a program is the bottom of the heap slot.
+//
+// NOTHING ON THIS PATH ALLOCATES, AND NOTHING MAY BE ADDED THAT DOES (M6). This is
+// the first malloc of the program, so the lists do not exist yet: a call to malloc,
+// calloc, or anything built on them from in here would find `initialised` set (see
+// below), search a list that has not been built, and read through a NULL avail
+// pointer, or, with the flag set later, recurse into this function forever until
+// the stack ran off the bottom of PD[3]. The first block's header and footer are
+// therefore written directly, field by field, and the lists are initialised by
+// direct assignment.
+static int el_init(size_t initial_heap_size){
+  void *heap = (void *) sys_mmap(initial_heap_size);
+  if(heap == MMAP_FAILED){
+    sys_print("malloc: could not get the initial slab from SYS_MMAP\n");
     return 1;
   }
+
+  // Set the flag HERE, before the first block is built, not after. Once the slab
+  // exists this is a heap, and every later entry into malloc must see it as one
+  // rather than start building a second first slab on top of the first.
+  initialised = 1;
 
   el_ctl->heap_bytes = initial_heap_size;    // make the heap as big as possible to begin with
   el_ctl->heap_start = heap;                 // set addresses of start and end of heap
   el_ctl->heap_end   = PTR_PLUS_BYTES(heap,el_ctl->heap_bytes);
 
   if(el_ctl->heap_bytes < EL_BLOCK_OVERHEAD){
-    print_string("el_init: heap size too small for a block overhead\n");
+    sys_print("malloc: heap size too small for a block overhead\n");
     return 1;
   }
 
@@ -356,25 +362,29 @@ static int el_init(uint64_t initial_heap_size){
 
 int el_append_pages_to_heap(int npages) {
   size_t nbytes = (size_t) npages * EL_PAGE_BYTES;
-  void *mapped = (void *) alloc_frames_contiguous((uint32_t) npages); // grow the slab
-  if(mapped == NULL){     // Fail if no contiguous run of that length is free
-    print_string("heap grow: no contiguous run of frames available\n");
+  void *mapped = (void *) sys_mmap(nbytes); // grow the slab
+  if(mapped == MMAP_FAILED){     // Fail if the kernel refused: out of frames, out of region slots, or the 2MB ceiling
+    sys_print("malloc: heap grow: SYS_MMAP refused another slab\n");
     return 1;
   }
-  // The p5 heap is ONE contiguous slab: heap_end must be the literal next byte,
-  // because el_block_above/el_block_below walk memory linearly and are bounded by
-  // a single heap_end/heap_start pair. The frame allocator scans its bitmap
-  // bottom-up and this heap is its only consumer, so a growth run comes back
-  // immediately above heap_end (adjacent) by construction. If it ever did not,
-  // splicing a disjoint region into the single-heap walk would let those walks
-  // step into the gap between regions and read garbage, so we refuse and reclaim
-  // the frames rather than corrupt the heap. In this kernel this branch does not
-  // trigger; it exists so a future non-adjacent case fails loudly, not silently.
+  // THE PORTED ALLOCATOR ASSUMES ONE CONTIGUOUS SPAN, and this check is what makes
+  // that assumption safe on top of SYS_MMAP. el_block_above and el_block_below walk
+  // memory linearly and are bounded by a single heap_start/heap_end pair, so
+  // heap_end must be the literal next byte of the new slab. The kernel copy could
+  // rely on the frame allocator's bottom-up scan to make a growth run adjacent;
+  // SYS_MMAP promises no such thing in general, only that a region is placed at the
+  // lowest address above every region the program holds. When malloc is the only
+  // thing in the program calling SYS_MMAP that address IS heap_end, so growth works
+  // and the heap stays one span; if the program has mapped something of its own in
+  // between, the new slab lands above it and is NOT adjacent. Splicing a disjoint
+  // slab into the single-span walk would let el_block_above step off the end of
+  // the old slab into whatever sits in the gap (unmapped pages, or the program's
+  // own region) and read garbage as a block header, so the slab is given straight
+  // back and the growth fails. malloc then returns NULL. That is the "keep one span
+  // and fail" choice from docs/decisions/0024, with the failure made loud.
   if(mapped != el_ctl->heap_end){
-    print_string("heap grow: non-adjacent run, refusing to fragment heap\n");
-    for(uint32_t k = 0; k < (uint32_t) npages; k++){
-      free_frame((uint64_t) mapped + (uint64_t) k * EL_PAGE_BYTES);
-    }
+    sys_print("malloc: heap grow: non-adjacent slab, refusing to fragment heap\n");
+    sys_munmap((unsigned long) mapped, nbytes);
     return 1;
   }
   el_blockhead_t *b = (el_blockhead_t *) el_ctl->heap_end;
@@ -394,87 +404,29 @@ int el_append_pages_to_heap(int npages) {
 }
 
 // ============================================================================
-// Debug/stats helpers (kept from p5, made kernel-native).
+// Public interface: malloc/free/calloc.
 // ============================================================================
 
-static void el_print_blocklist(el_blocklist_t *list){
-  print_string("{length: ");
-  print_dec(list->length);
-  print_string("  bytes: ");
-  print_dec(list->bytes);
-  print_string("}\n");
-  el_blockhead_t *block = list->beg;
-  for(size_t i = 0; i < list->length; i++){
-    block = block->next;
-    print_string("  [");
-    print_dec(i);
-    print_string("] head @ ");
-    print_hex((uint64_t) block);
-    print_string(" {state: ");
-    print_char(block->state);
-    print_string("  size: ");
-    print_dec(block->size);
-    print_string("}\n");
+// malloc: allocate `size` bytes. If no block fits, grow the slab and retry. The
+// el_malloc core is unchanged; the first-call initialisation, the rounding, and
+// the grow-and-retry policy live here in the wrapper so el_malloc stays the pure
+// p5 algorithm, exactly as kmalloc's wrapper does in the kernel.
+void *malloc(size_t size){
+  if(!initialised){
+    // M6. The first malloc of a program builds the heap. el_init sets the flag
+    // itself, before it writes the first block, and touches nothing that
+    // allocates; see the comment on it. If it fails (SYS_MMAP refused) the flag
+    // stays clear, so the next call tries again rather than walking lists that
+    // were never built.
+    if(el_init((size_t) HEAP_INITIAL_PAGES * EL_PAGE_BYTES) != 0){
+      return NULL;
+    }
   }
-}
 
-static void el_print_block(el_blockhead_t *block){
-  el_blockfoot_t *foot = el_get_footer(block);
-  print_hex((uint64_t) block);
-  print_string("\n  state: ");
-  print_char(block->state);
-  print_string("  size: ");
-  print_dec(block->size);
-  print_string("  foot->size: ");
-  print_dec(foot->size);
-  print_string("\n");
-}
+  // Round up to a multiple of 8 so the payload is 8-byte aligned (difference 5
+  // above). A request of 0 becomes a zero-sized block, which the core handles.
+  size = (size + 7) & ~(size_t)7;
 
-static void el_print_heap_blocks(){
-  int i = 0;
-  el_blockhead_t *cur = el_ctl->heap_start;
-  while(cur != NULL){
-    print_string("[");
-    print_dec((uint64_t) i);
-    print_string("] @ ");
-    el_print_block(cur);
-    cur = el_block_above(cur);
-    i++;
-  }
-}
-
-void heap_print_stats(){
-  print_string("HEAP STATS (overhead per node: ");
-  print_dec(EL_BLOCK_OVERHEAD);
-  print_string(")\nheap_start:  ");
-  print_hex((uint64_t) el_ctl->heap_start);
-  print_string("\nheap_end:    ");
-  print_hex((uint64_t) el_ctl->heap_end);
-  print_string("\ntotal_bytes: ");
-  print_dec(el_ctl->heap_bytes);
-  print_string("\nAVAILABLE LIST: ");
-  el_print_blocklist(el_ctl->avail);
-  print_string("USED LIST: ");
-  el_print_blocklist(el_ctl->used);
-  print_string("HEAP BLOCKS:\n");
-  el_print_heap_blocks();
-}
-
-// ============================================================================
-// Public interface: kmalloc/kfree/heap_init and the two accessors.
-// ============================================================================
-
-void heap_init(void){
-  if(el_init((uint64_t) HEAP_INITIAL_PAGES * EL_PAGE_BYTES) != 0){
-    print_string("heap_init: FAILED to build initial slab\n");
-  }
-}
-
-// kmalloc: allocate `size` bytes. If no block fits, grow the slab and retry.
-// The el_malloc core is unchanged; the grow-and-retry policy and the interrupt
-// guard live here in the wrapper so el_malloc stays the pure p5 algorithm.
-void *kmalloc(size_t size){
-  uint64_t flags = irq_save();   // free list is shared state, keep the timer out
   void *p = el_malloc(size);
   if(p == NULL){
     // No block large enough. Grow by at least HEAP_GROW_PAGES, or more if the
@@ -488,53 +440,29 @@ void *kmalloc(size_t size){
       p = el_malloc(size);
     }
   }
-  irq_restore(flags);
   return p;
 }
 
-void kfree(void *ptr){
-  uint64_t flags = irq_save();
-  el_free(ptr);
-  irq_restore(flags);
-}
-
-size_t heap_avail_count(void){
-  return el_ctl->avail->length;
-}
-
-size_t heap_total_bytes(void){
-  return el_ctl->heap_bytes;
-}
-
-// Sum the payload sizes of every in-use block, walking the heap block by block via
-// el_block_above (the same linear walk el_print_heap_blocks uses). It TRUSTS NO
-// CACHED COUNTER: a leak test wants an independent count for the same reason
-// fat32_free_count recounts the FAT rather than reading FSInfo's cached total -- a
-// counter that is itself buggy would hide the very leak it is meant to reveal. It is
-// slow (a whole-heap walk) and only ever called off the allocation path, from the
-// LIFECYCLE_DEBUG reap report and leak tests, like frame_free_count.
-//
-// BOUNDED, the same discipline as free_chain in fs/fat32.c: a corrupt heap could make
-// the walk cycle or never reach heap_end, so it is capped at the most blocks the heap
-// could possibly hold (one per overhead unit) and returns the error sentinel
-// (uint64_t)-1 rather than looping forever. Guarded like kmalloc/kfree, because it
-// reads the shared block structure and the timer's kmalloc must not relink it mid-walk.
-uint64_t heap_used_bytes(void){
-  uint64_t flags = irq_save();
-  uint64_t used = 0;
-  uint64_t seen = 0;
-  uint64_t max_blocks = (uint64_t) el_ctl->heap_bytes / EL_BLOCK_OVERHEAD + 1;
-  el_blockhead_t *cur = el_ctl->heap_start;
-  while(cur != NULL){
-    if(++seen > max_blocks){
-      irq_restore(flags);
-      return (uint64_t) -1;   // walk did not terminate: the heap is corrupt
-    }
-    if(cur->state == EL_USED){
-      used += cur->size;
-    }
-    cur = el_block_above(cur);
+void free(void *ptr){
+  if(ptr == NULL){
+    return;   // C's free(NULL) is a no-op (difference 4 above)
   }
-  irq_restore(flags);
-  return used;
+  el_free(ptr);
+}
+
+// calloc: `count` objects of `size` bytes each, zeroed. The multiplication is
+// checked for overflow first, because a wrapped product is a small request that
+// hands back far less memory than the caller then writes into.
+void *calloc(size_t count, size_t size){
+  if(count != 0 && size > ((size_t)-1) / count){
+    return NULL;
+  }
+  size_t total = count * size;
+  void *p = malloc(total);
+  if(p != NULL){
+    // Always cleared, even though a fresh slab arrives zeroed from the kernel: a
+    // block being REUSED after a free holds whatever its last owner wrote.
+    memset(p, 0, total);
+  }
+  return p;
 }
