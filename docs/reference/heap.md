@@ -12,6 +12,14 @@ The heap is a layer on top of the frame allocator. The frame allocator
 arbitrary-size blocks. Keep the two straight: frames are pages, `kmalloc` is
 bytes on pages.
 
+**Ported twice.** `libc/malloc.c` is this allocator again, in ring 3, with
+`SYS_MMAP` where `alloc_frames_contiguous` is here and no interrupt guard; the block
+layout, the two lists, the split, the coalesce and every function name are
+identical, so the two files can be diffed and a bug found in one can be looked for
+in the other by name. Both say so at the top, and the differences are enumerated at
+the top of `libc/malloc.c`. See [user-memory.md](user-memory.md) and
+[decisions/0024](../decisions/0024-user-memory-and-libc.md).
+
 ## The block layout: header, user data, footer
 
 Every block is a header, then the user's bytes, then a footer:
@@ -139,4 +147,5 @@ state, restore exactly that.
 
 - The frame allocator underneath: [memory-map.md](memory-map.md).
 - The decision record: [decisions/0010](../decisions/0010-kernel-heap-ported-from-p5.md).
+- The second port, as the ring-3 `malloc`: [user-memory.md](user-memory.md).
 - The fixed task table this unblocks: [scheduling.md](scheduling.md).

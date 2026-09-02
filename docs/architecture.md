@@ -39,9 +39,9 @@ This page is a map, not a tutorial. For the concepts behind each subsystem, see
 | `kernel/` | Core kernel: GDT/TSS, IDT, interrupt dispatch, syscall dispatch, timer, physical frame allocator, the kernel heap, per-process paging, ring-3 entry, the scheduler, and `kernel_main`. |
 | `drivers/` | Hardware drivers: VGA text screen, PS/2 keyboard, the polled ATA PIO disk driver, port I/O helpers. |
 | `fs/` | The filesystem layer, above the disk driver: read-only FAT32 (list the root directory, read a file by name). |
-| `libc/` | Minimal freestanding C library: `string` and `mem` routines. |
+| `libc/` | Freestanding C library, compiled twice: into the kernel (`mem`, `string`) and into every ring-3 program (`mem`, `string`, `malloc`, `printf`). |
 | `user/` | The ring-3 programs, built as standalone static ELF64 binaries (linked with `user/user.ld`) that live on the disk image and are loaded at runtime, not part of `townos.bin`. Holds the interactive shell (`user/shell.c`, booted as `SHELL.ELF`), which is the program the machine is for, and the runtime everything compiles against (`user/userlib.h`, `user/user.ld`). |
-| `user/tests/` | Kernel test fixtures: ring-3 programs that exist to prove a piece of the kernel works and would be pointless on a machine anybody used (`A.c`, `B.c`, `C.c`, `D.c`, `E.c`). They build identically to the shell and land on the same disk; the split is about what a reader should conclude when one of them looks strange. See `user/tests/README.md`. |
+| `user/tests/` | Kernel test fixtures: ring-3 programs that exist to prove a piece of the kernel works and would be pointless on a machine anybody used (`A.c` through `K.c`, plus `COUNT.c`, `UPPER.c` and `ONCE.c`). They build identically to the shell and land on the same disk; the split is about what a reader should conclude when one of them looks strange. See `user/tests/README.md`. |
 | `include/` | Shared definitions (`types.h`, the vector map, the syscall ABI numbers). |
 
 ## Source files
@@ -59,7 +59,7 @@ This page is a map, not a tutorial. For the concepts behind each subsystem, see
 | `user/shell.c` | The interactive shell: a ring-3 program (`SHELL.ELF`) that reads a line via `SYS_READKEY`, tokenizes it, and dispatches `list`/`read`/`run`/`help`/`clear`/`return` through syscalls. | Implemented |
 | `user/tests/A.c`, `B.c`, `C.c` | Kernel test fixtures, each a separate static ELF64 binary on the disk image, launched on demand with the shell's `run`. A prints 20 letters and exits 0 (the ordinary case, with a real `.bss`), B prints 60 (a second binary of a visibly different length), C prints 40 and exits **3** (proving a non-zero status survives the trip back to the prompt). | Implemented |
 | `user/tests/D.c`, `E.c` | The sweeper fixtures. D starts E and exits **without** waiting, which orphans E; E is then the only kind of zombie `reap_sweep`'s free path and `parent_alive`'s "no" branch can ever see. `run d.elf` is the only test that reaches them. | Implemented |
-| `user/userlib.h` | The whole runtime a user program gets: `always_inline` inline-asm syscall wrappers and the delay loop. | Implemented |
+| `user/userlib.h` | The whole runtime a user program gets: `always_inline` inline-asm syscall wrappers, the delay loop, the tokenizer, and the `malloc`/`printf` prototypes; it includes the two libc headers. | Implemented |
 | `user/user.ld` | User program linker script: entry `_start`, load address 0x400000, every loadable segment page-aligned (a contract with the loader). | Implemented |
 | `kernel/gdt_flush.asm` | `lgdt`, reload data segments, reload CS via far return, `ltr`. | Implemented |
 | `kernel/idt.c`, `kernel/idt.h` | IDT table, `idt_set_entry`, PIC remap, IDT zeroing, `lidt`. | Implemented |
@@ -73,8 +73,10 @@ This page is a map, not a tutorial. For the concepts behind each subsystem, see
 | `drivers/disk.c`, `drivers/disk.h` | Polled ATA PIO disk driver: `disk_init`/`disk_read`/`disk_write` move 512-byte LBA28 blocks on the primary bus. | Implemented |
 | `drivers/ports.c`, `drivers/ports.h` | `in`/`out` port I/O wrappers (byte and word, in and out). | Implemented |
 | `fs/fat32.c`, `fs/fat32.h` | Read-only FAT32: `fat32_init` parses the boot sector, `fat32_list_root` lists the root directory, `fat32_read_file` reads a file by 8.3 name, `fat32_stat` reports a size without reading. | Implemented (read-only; the ELF loader reads programs through it) |
-| `libc/string.c`, `libc/string.h` | `strlen`, `strcmp`, `strcpy`. | Implemented |
-| `libc/mem.c`, `libc/mem.h` | `memcpy`, `memset`. | Implemented |
+| `libc/string.c`, `libc/string.h` | `strlen`, `strcmp`, `strcpy`, `strchr`. Compiled into the kernel and into ring 3. | Implemented |
+| `libc/mem.c`, `libc/mem.h` | `memcpy`, `memmove`, `memset`, `memcmp`. Compiled into the kernel and into ring 3. | Implemented |
+| `libc/malloc.c` | Ring-3 only: `malloc`, `free`, `calloc`, the kernel heap's allocator ported a second time on `SYS_MMAP`. | Implemented |
+| `libc/printf.c` | Ring-3 only: `printf` with `%d %u %x %s %c %%`, on `sys_write_all`. | Implemented |
 | `include/types.h` | Fixed-width integer types and `NULL`. | Implemented |
 | `include/vectors.h` | Single source of truth for every interrupt vector, including `SYSCALL_VECTOR`. | Implemented |
 | `include/syscalls.h` | Standalone syscall ABI numbers (`SYS_EXIT`, `SYS_WRITE`, `SYS_WAIT`, ...), no kernel code. | Implemented |

@@ -340,6 +340,9 @@ name in the root, so `run a.elf` finds them (the lookup is case-insensitive).
 | `E.ELF` | prints `E` 15 times | 7 | the orphan nobody reaps |
 | `H.ELF` | prints `H` 40 times, catches `SIG_INT` | 0 | a program that is interrupted and RESUMED, not killed |
 | `ONCE.ELF` | reads fd 0 once and exits | 0 | the reader that leaves early, so a writer gets `SIG_PIPE` |
+| `I.ELF` | `malloc`s 300 blocks, verifies, frees shuffled, reuses | 0 | `malloc`/`free`/`calloc`, and that the heap slot is freed at exit |
+| `J.ELF` | abuses `SYS_MMAP` and `SYS_MUNMAP` | 0 | every refusal the kernel must make, with memory intact |
+| `K.ELF` | prints every `printf` specifier | 0 | `printf`, including the failures it is designed to have |
 
 Four more fixtures are not in the table because their point is elsewhere: `F.ELF`,
 the multi-cluster write test, is self-checking and exits 0 only on an exact
@@ -359,21 +362,22 @@ whose entire program is that it does *not* call `sys_wait`.
 
 ```
 > run d.elf
-run: started d.elf
 D: starting E
-ED: not waiting, exiting
-reap (sweeper): task 1 exited (status 0), free frames: 30513, heap used: 1816
+Erun: started d.elf
+D: not waiting, exiting
+reap (sweeper): task 2 exited (status 0), free frames: 29998, heap used: 2200
 run: d.elf exited with status 0
 > EEEEEEEEEEEEEE
-> reap (sweeper): task 2 exited (status 7), free frames: 30585, heap used: 1192
+> reap (sweeper): task 3 exited (status 7), free frames: 30072, heap used: 1448
 ```
 
-That is captured output, pasted as the machine printed it, which is why it looks
-untidy. Two tasks and a shell are printing into one screen with no locking, so a
-line can land in the middle of another one (`Ereap (sweeper):` is an `E` from the
-orphan arriving between the shell's characters), and the order of the `run:` lines
-against the reap line is a scheduling artefact rather than a fixed sequence. E's
-line comes after a `>` because it needed the keypress described below to appear.
+That is captured output, pasted as the machine printed it (after one `run a.elf`,
+so D is task 2 and E task 3), which is why it looks untidy. Two tasks and a shell
+are printing into one screen with no locking, so a line can land in the middle of
+another one (`Erun: started d.elf` is an `E` from the orphan arriving before the
+shell's own line), and the order of the `run:` lines against the reap line is a
+scheduling artefact rather than a fixed sequence. E's line comes after a `>`
+because it needed the keypress described below to appear.
 
 Four things to read out of that:
 
@@ -388,7 +392,7 @@ Four things to read out of that:
   the sweeper drops the tombstone rather than keeping a fact nobody can ask for.
   Seven is distinctive purely so it would be obvious, not plausible, if it ever
   turned up at the prompt.
-- **The free frame count comes back to the baseline** — 30585 here — from a path
+- **The free frame count comes back to the baseline** — 30072 here — from a path
   that had never executed before.
 
 One timing quirk worth knowing: if the machine is completely idle when the orphan
@@ -437,8 +441,8 @@ forever, and the only symptom was a prompt that never came back.
 ```
 > run g.elf | run once.elf
 ONCE: read 64 bytes, exiting
-reap (wait):    task 5 exited (status 0), free frames: 30510, heap used: 5928
-reap (wait):    task 4 exited (status 141), free frames: 30585, heap used: 1192
+reap (wait):    task 6 exited (status 0), free frames: 29994, heap used: 6312
+reap (wait):    task 5 exited (status 141), free frames: 30072, heap used: 1448
 pipeline exited with status 0
 ```
 
@@ -474,14 +478,37 @@ run: count.elf exited with status 0
 
 ```
 > run d.elf
-...
-> ps
+D: starting E
+Erun: started d.elf
+D: not waiting, exiting
+reap (sweeper): task 3 exited (status 0), free frames: 29998, heap used: 2200
+run: d.elf exited with status 0
+> EpEsE
   id  parent  pgid  state    status
   0   -       0     running
-  2   1       1     ready
-> kill 2
-reap (sweeper): task 2 exited (status 130), free frames: 30585, heap used: 1192
+  4   3       3     ready
+> EEEEEEEEEEE
+> reap (sweeper): task 4 exited (status 7), free frames: 30072, heap used: 1448
 ```
+
+`ps` typed while E prints (the `p` and `s` land between the `E`s) shows E as task
+4, parent 3, in group 3: a group the shell is not in. And, on a fresh boot where D
+is task 1 and E task 2, `kill 2` typed the same way:
+
+```
+> run d.elf
+D: starting E
+Erun: started d.elf
+D: not waiting, exiting
+reap (sweeper): task 1 exited (status 0), free frames: 29998, heap used: 2200
+run: d.elf exited with status 0
+> kEiElElE EE2E
+>
+> reap (sweeper): task 2 exited (status 130), free frames: 30072, heap used: 1448
+```
+
+E dies with status 130 (128 + `SIG_INT`) instead of finishing its fifteen rounds,
+and its reap line appears on the next keypress, as above.
 
 **These two exist because the keyboard cannot reach everything, and that is by
 design rather than an oversight.** Ctrl-C is addressed to the foreground group only.
@@ -522,4 +549,7 @@ launches it. See [../building.md](../building.md).
   [decision 0018](../decisions/0018-process-lifecycle-exit-and-wait.md).
 - The sleep behind a blocking `SYS_READKEY`: [blocking.md](blocking.md),
   [decision 0017](../decisions/0017-blocking-and-sleep.md).
+- The `printf` the shell prints numbers with, and the memory a program can ask for:
+  [user-memory.md](user-memory.md) and
+  [decision 0024](../decisions/0024-user-memory-and-libc.md).
 - The decision behind all of this: [decision 0016](../decisions/0016-interactive-shell.md).

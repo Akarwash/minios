@@ -57,11 +57,17 @@ and cheaper). Each tree is therefore deliberately MIXED page sizes: 4KB user,
    bookkeeping, safe there) and its own PML4, PDPT, and PD from `alloc_frame`
    (page tables must be 4KB and 4KB-aligned, which `alloc_frame` guarantees and
    `kmalloc` does not).
-2. Fill the PD by COPYING every boot `pd_table` entry EXCEPT the two user slots
-   (`pd_table[2]` = user code, `pd_table[3]` = user stack), which are left absent
-   so the user branch can be overridden with private 4KB page tables. Each copied
-   kernel entry carries the identical 2MB huge-page mapping (same physical kernel
-   frame, no user bit), so every tree maps the identical kernel, kernel-only.
+2. Fill the PD by COPYING every boot `pd_table` entry EXCEPT the three user slots
+   (`pd_table[2]` = user code, `pd_table[3]` = user stack, `pd_table[4]` = user
+   heap), which are left absent so the user branch can be overridden with private
+   4KB page tables. Each copied kernel entry carries the identical 2MB huge-page
+   mapping (same physical kernel frame, no user bit), so every tree maps the
+   identical kernel, kernel-only. The three indices live in one array,
+   `user_pd_slots`, which the teardown reads too (see below). `PD[4]` was the
+   boot tree's identity map of physical 8-10M, which is why those frames are now
+   reserved from the pool ([memory-map.md](memory-map.md)) and why the slot must
+   be left absent rather than copied: `next_table` would follow a copied huge-page
+   entry as if it were a page table.
 3. Wire `PDPT[0] -> this PD` and `PML4[0] -> this PDPT`, both user-permissive.
 
 `paging_map_page(as, virt, phys, flags)` then installs the private user mappings,
@@ -77,7 +83,7 @@ and the ring-3 region lives INSIDE that same `pd_table` (user code is
 `pd_table[2]`, user stack `pd_table[3]`). Sharing `pd_table` by reference would
 share the user huge pages too, making a private 4KB mapping at `0x400000`
 impossible: the whole point. So the kernel half is cloned by value, entry by
-entry, skipping the two user slots.
+entry, skipping the three user slots.
 
 ## The load-bearing invariant: kernel mappings are frozen after boot
 
@@ -113,7 +119,7 @@ kernel memory: the AND of the levels is kernel-only at the leaf.
 ## What a task's user half holds
 
 `task_create_from_file` (`kernel/scheduler.c`) fills the private user half in two
-steps, from two different places:
+steps, from two different places, and a third slot is filled later, on request:
 
 - **Program image, by the ELF loader.** `elf_load_file` (`kernel/elf.c`) reads
   ONE program's file off the disk and walks its `PT_LOAD` segments. For each
@@ -129,6 +135,12 @@ steps, from two different places:
   program writes its own stack as it runs. Every task reuses the same VA on its
   own frames, which is exactly what per-process paging makes possible and what
   retires the old shared-stack-region ceiling.
+- **Heap, by `SYS_MMAP`, at run time.** `PD[4]` (`0x800000` up to `0xA00000`) is
+  empty when the task starts. `paging_map_user_range` fills it one region at a
+  time with fresh, zeroed frames, `PG_PRESENT | PG_WRITABLE | PG_USER`, unwinding
+  every page it mapped if a frame or page table runs out, and
+  `paging_unmap_user_range` empties a region again, flushing each page from the
+  TLB. See [user-memory.md](user-memory.md).
 
 **This used to be one step from one source, and the difference matters.** Before
 per-file loading ([decision 0015](../decisions/0015-elf-program-loading.md)) a function
@@ -182,13 +194,17 @@ calls it on every failure path after the create succeeded, so a program that fai
 to load costs nothing.
 
 **It frees the USER half only.** It walks `pml4[0] → pdpt[0] → pd` and then
-descends into exactly two PD entries — `USER_PD_INDEX_CODE` (2) and
-`USER_PD_INDEX_STACK` (3) — freeing the present leaf pages of each page table, then
+descends into exactly three PD entries — `USER_PD_INDEX_CODE` (2),
+`USER_PD_INDEX_STACK` (3) and `USER_PD_INDEX_HEAP` (4), the `user_pd_slots` array
+that the clone also reads — freeing the present leaf pages of each page table, then
 the page table itself, then the PD, the PDPT, and the PML4, and finally `kfree`s
-the handle.
+the handle. The heap slot being in that list is what returns a program's
+`SYS_MMAP` regions at exit: `task_exit` knows nothing about regions, and `malloc`
+never releases a slab, so this walk is the only thing that frees them.
 
-The list of two indices is the whole safety of the function, and it is why it is
-written as an explicit list rather than a loop over present entries. **A generic
+The list of three indices is the whole safety of the function, and it is why it is
+written as an explicit list rather than a loop over present entries. It is also the
+single place that has to change if a fourth user region is ever added. **A generic
 "free everything present in this tree" walk would be catastrophic**: the kernel
 half is cloned *by value* into every tree, so those entries point at the shared
 kernel mappings, and freeing them returns the live kernel's memory to the frame
@@ -225,32 +241,37 @@ only come into being when somebody types `run`. So the thing to watch is a tree
 appearing and disappearing, not three of them starting together.
 
 Booted under QEMU with `-d int`, sitting at the prompt, then `run a.elf`, the CR3
-column reads (counts are consecutive runs of interrupts at that CR3):
+column reads (counts are consecutive runs of interrupts at that CR3; regenerated
+after the user-memory rung, which is why the addresses differ from older
+transcripts):
 
 ```
-    1 CR3=000000000010d000     one tick on the boot tree, before scheduler_start
-  403 CR3=0000000000810000     the shell alone, blocked in readkey
-    3 CR3=0000000000860000     A's tree exists; the two interleave
-    4 CR3=0000000000810000
-  136 CR3=0000000000860000
-  555 CR3=0000000000810000     A has exited and been reaped; the shell alone again
+    2 CR3=0000000000111000     ticks on the boot tree, before scheduler_start
+  336 CR3=0000000000a10000     the shell alone, blocked in readkey
+    2 CR3=0000000000a68000     A's tree exists; the two interleave
+    5 CR3=0000000000a10000
+  136 CR3=0000000000a68000
+  141 CR3=0000000000a10000     A has exited and been reaped; the shell alone again
 ```
 
 and the vectors over the same run:
 
 ```
- 1016 v=40      timer, IRQ 0
-   66 v=50      syscalls
+  537 v=40      timer, IRQ 0
+   65 v=50      syscalls
    20 v=41      keyboard, IRQ 1 — one per key of "run a.elf" plus the newline
 ```
 
 Read four things out of that. There are exactly two task CR3 values because there
-were exactly two tasks, and the boot CR3 appears once, before the first switch.
+were exactly two tasks, and the boot CR3 appears only before the first switch.
 The middle stretch alternates between the two trees, which is the round-robin.
-The long runs at `0x810000` at each end are the shell alone with nothing to switch
-to. And there is **no `v=0e`, `v=0d` or `v=08`** anywhere: no page fault, no
-general protection fault, no double fault. The `cpl=3` RIPs are all inside
-`0x400000`–`0x400b27`, the loaded image's own range, in both trees.
+The long runs at `0xa10000` at each end are the shell alone with nothing to switch
+to; the shell's PML4 is at `0xa10000` rather than the `0x810000` of older
+transcripts because physical 8-10M is now reserved and the first free frame is
+above 10M. And there is **no `v=0e`, `v=0d` or `v=08`** anywhere: no page fault,
+no general protection fault, no double fault. The `cpl=3` RIPs are all inside
+`0x40009f`–`0x4071b7`, the loaded image's own range (larger than it was, since
+every program now links the ring-3 libc), in both trees.
 
 A temporary isolation proof (added, verified, then removed) walked each task's
 tree and confirmed the shared VAs `0x400000` and the stack top page resolve to
@@ -270,6 +291,9 @@ at a user RIP means the private user mapping for that task is missing or wrong.
   [decision 0018](../decisions/0018-process-lifecycle-exit-and-wait.md).
 - The physical layout and the fixed user virtual addresses:
   [memory-map.md](memory-map.md).
+- The heap slot, `SYS_MMAP`/`SYS_MUNMAP`, and the map/unmap helpers:
+  [user-memory.md](user-memory.md) and
+  [decision 0024](../decisions/0024-user-memory-and-libc.md).
 - The shared-region layout this replaces:
   [decision 0011](../decisions/0011-dynamic-tasks-and-stacks.md).
 - Concepts behind virtual memory and page tables:

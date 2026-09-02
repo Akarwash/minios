@@ -69,7 +69,9 @@ class differs.
 
 It also builds the user programs, which are separate binaries and not part of
 `townos.bin`: `user/SHELL.ELF`, the interactive shell, plus the kernel test
-fixtures `user/tests/A.ELF` through `E.ELF`. The two directories build with the
+fixtures `user/tests/A.ELF` through `K.ELF` and `COUNT.ELF`, `UPPER.ELF`,
+`ONCE.ELF`, each linked against the ring-3 half of `libc/` (the `.user.o`
+objects) and the signal trampoline. The two directories build with the
 same recipe and land on the same disk; `user/` holds the program the machine is
 *for* and `user/tests/` holds programs that exist only to prove a piece of the
 kernel works (see `user/tests/README.md`). See
@@ -149,7 +151,7 @@ The image's contents come from two places, and the split is not cosmetic:
 | `TEST.TXT` | 19 | `tools/mkdisk.sh` | once, when the image is created |
 | `BIG.TXT` | 16384 | `tools/mkdisk.sh` | once, when the image is created |
 | `HUGE.TXT` | 40981 | `make disk-testfiles` | every `make run` |
-| `SHELL.ELF`, `A`–`E.ELF` | ~13K each | `make disk-programs` | every `make run` |
+| `SHELL.ELF`, `A`–`K.ELF`, `COUNT`/`UPPER`/`ONCE.ELF` | ~22K each, the shell ~48K | `make disk-programs` | every `make run` |
 
 `mkdisk.sh` refuses to touch an image that already exists, so **anything added to
 that script reaches a freshly formatted disk and no other** — a developer with a

@@ -2,8 +2,9 @@
 
 These are ring-3 programs that exist to prove a piece of the kernel works. They are
 not part of the machine's runtime: nobody would want them on a computer they were
-using. The shell (`../shell.c`) is the real program, and `../userlib.h` and
-`../user.ld` are the runtime every program here compiles against.
+using. The shell (`../shell.c`) is the real program, and `../userlib.h`,
+`../user.ld` and the ring-3 half of `../../libc/` (`malloc`, `printf`, the string
+and memory functions) are the runtime every program here compiles against.
 
 They build exactly like any other user program — freestanding, static,
 `-mcmodel=small`, linked at `0x400000` — and they land in the **root directory** of
@@ -28,8 +29,8 @@ loader's zero-fill honest: a program with no `.bss` would load correctly even if
 that step were missing.
 
     > run a.elf
-    run: started a.elf
-    AAAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30585, heap used: 1192
+    Arun: started a.elf
+    AAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30072, heap used: 1448
     run: a.elf exited with status 0
 
 This is the baseline for the memory test. Run it ten times and the free frame count
@@ -68,18 +69,18 @@ here: the free path that tears a zombie's address space down, and the branch of
 what reaches them, and the output below shows how.
 
     > run d.elf
-    run: started d.elf
     D: starting E
-    ED: not waiting, exiting
-    reap (sweeper): task 1 exited (status 0), free frames: 30513, heap used: 1816
+    Erun: started d.elf
+    D: not waiting, exiting
+    reap (sweeper): task 2 exited (status 0), free frames: 29998, heap used: 2200
     run: d.elf exited with status 0
     > EEEEEEEEEEEEEE
-    > reap (sweeper): task 2 exited (status 7), free frames: 30585, heap used: 1192
+    > reap (sweeper): task 3 exited (status 7), free frames: 30072, heap used: 1448
 
 Both D and E are reaped by the **sweeper**, and which path frees which is decided
-by where they sit in the task table, not by luck. The table is `shell` = 0, `D` =
-1, `E` = 2. When D exits it wakes the shell, its parent, but `find_next_ready` scans
-forward from the slot *after* D and so reaches E at slot 2 before it wraps back to
+by where they sit in the task table, not by luck. The table is `shell` = 0, `A` =
+1 (from the run above), `D` = 2, `E` = 3. When D exits it wakes the shell, its parent, but `find_next_ready` scans
+forward from the slot *after* D and so reaches E at slot 3 before it wraps back to
 the shell at slot 0: E, not the shell, is what runs next, and it gets a full
 timeslice. The next timer tick enters `schedule` with `current` = E, and
 `reap_sweep` — which runs at the top of every `schedule` and frees any zombie that
@@ -97,7 +98,7 @@ again which path frees D before trusting this output.
 
 Two more things the run shows. The prompt returns while E is still printing,
 because the shell waited for D and not for E and stays usable throughout. And D's
-line reports fewer free frames than E's (30513 against 30585 here): when D is swept
+line reports fewer free frames than E's (29998 against 30072 here): when D is swept
 E is still running and holding its own address space, and E's line is the count
 coming back to the baseline once E is gone too.
 
@@ -215,7 +216,7 @@ passes, with a distinct non-zero status per failure mode (listed at the top of
     syscall: SYS_MMAP rejected a length outside the 2MB heap slot
     malloc: heap grow: SYS_MMAP refused another slab
     I: 300 blocks allocated, verified, freed in shuffled order, and reused
-    reap (wait):    task 2 exited (status 0), free frames: 30071, heap used: 1448
+    reap (wait):    task 2 exited (status 0), free frames: 30072, heap used: 1448
     run: i.elf exited with status 0
 
 The two lines before the verdict are the 3MB request being refused: the kernel says
@@ -248,16 +249,16 @@ check (listed at the top of `J.c`), and prints one line either way.
     syscall: SYS_MUNMAP rejected an address that is not a region's start
     syscall: SYS_MUNMAP rejected an address that is not a region's start
     syscall: SYS_MUNMAP rejected an address that is not a region's start
+    run: started j.elf
     syscall: SYS_MUNMAP rejected an address that is not a region's start
     syscall: SYS_MUNMAP rejected an address that is not a region's start
     syscall: SYS_MUNMAP rejected an address that is not a region's start
     syscall: SYS_MMAP rejected: no free region slot
     syscall: SYS_MMAP rejected a length outside the 2MB heap slot
-    run: started j.elf
     syscall: SYS_MMAP rejected a region that would cross the 2MB ceiling
     syscall: SYS_MMAP rejected a region that would cross the 2MB ceiling
     J: every abuse refused, every region released, memory intact
-    reap (wait):    task 2 exited (status 0), free frames: 30073, heap used: 1448
+    reap (wait):    task 3 exited (status 0), free frames: 30072, heap used: 1448
     run: j.elf exited with status 0
 
 The kernel's `syscall: ... rejected` lines are the refusals, one per abuse, printed
@@ -290,6 +291,7 @@ format (M5 in [decision 0024](../../docs/decisions/0024-user-memory-and-libc.md)
     > run k.elf
     %d: 0 42 -42
     %u: 0 4294967295
+    run: started k.elf
     %x: 0 ff deadbeef
     %s: hello
     %c: ToS
@@ -301,8 +303,7 @@ format (M5 in [decision 0024](../../docs/decisions/0024-user-memory-and-libc.md)
     bad %s pointers:
     bad %s pointers:
     K: 11 lines checked
-    run: started k.elf
-    reap (wait):    task 1 exited (status 0), free frames: 30071, heap used: 1448
+    reap (wait):    task 4 exited (status 0), free frames: 30072, heap used: 1448
     run: k.elf exited with status 0
 
 The 144-character line wraps at the screen's 80 columns; it is one `printf` call,

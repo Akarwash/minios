@@ -30,7 +30,11 @@ the known limitations. It is a factual snapshot, not a roadmap.
   the Multiboot map reports (identity map extended to cover it, up to a 1GB cap),
   so it hands out real, mapped frames. See
   [reference/memory-map.md](reference/memory-map.md).
-- A minimal freestanding libc (`libc/string.c`, `libc/mem.c`).
+- A small freestanding libc (`libc/`), compiled twice: into the kernel and, with
+  the user flags, into every ring-3 program. `strlen`, `strcmp`, `strcpy`,
+  `strchr`, `memcpy`, `memmove`, `memset`, `memcmp`, and for ring 3 only
+  `malloc`/`free`/`calloc` (`libc/malloc.c`) and `printf` (`libc/printf.c`). See
+  [reference/user-memory.md](reference/user-memory.md).
 - A polled ATA PIO disk driver (`drivers/disk.c`): `disk_read` and `disk_write`
   move any run of contiguous 512-byte blocks between a disk and a buffer on the
   primary ATA bus, addressed by LBA28. It polls the status port (no interrupts,
@@ -84,7 +88,7 @@ the known limitations. It is a factual snapshot, not a roadmap.
   and [decisions/0006-user-mode-with-separate-pages.md](decisions/0006-user-mode-with-separate-pages.md).
 - System calls (`kernel/syscall.c`, `include/syscalls.h`): the ring-3 programs
   call back into the kernel through one `int 0x50` gate, the only DPL 3 gate in
-  the IDT. Fourteen calls: `SYS_WRITE` writes a counted buffer to a descriptor;
+  the IDT. Twenty-one calls: `SYS_WRITE` writes a counted buffer to a descriptor;
   `SYS_EXIT` ends the calling
   task with a status; `SYS_READKEY`
   pops one key from the keyboard ring buffer, sleeping the caller until one
@@ -98,10 +102,13 @@ the known limitations. It is a factual snapshot, not a roadmap.
   `SYS_STAT` reports a file's size without reading it, so the shell's `read` can
   size a buffer first and tell a missing file from one too big for it; and
   `SYS_READ`, `SYS_CLOSE`, `SYS_PIPE` are the descriptor calls (read from a fd,
-  close one, make a pipe). The
+  close one, make a pipe); `SYS_SIGNAL`, `SYS_KILL`, `SYS_SIGRETURN`, `SYS_SETFG`
+  and `SYS_TASKS` are the signal calls; and `SYS_MMAP`/`SYS_MUNMAP` give a program
+  anonymous memory in its heap slot. The
   dispatcher switches on RAX and returns its result in RAX; an unknown number is
   rejected, not fatal. Every pointer a call takes bounds the whole
-  `[ptr, ptr+len)` range with `user_range_ok` (write-target pointers included) and
+  `[ptr, ptr+len)` range with `user_range_ok` (write-target pointers included,
+  and the range now reaches the top of the heap slot) and
   caps copied filenames with `copy_user_string`; `SYS_WRITE` was a start-only
   stopgap until it became a counted `(fd, buf, len)` call. See
   [reference/syscalls.md](reference/syscalls.md),
@@ -180,11 +187,24 @@ the known limitations. It is a factual snapshot, not a roadmap.
   its slab from `alloc_frames_contiguous` (a new multi-page frame helper in
   `kernel/memory.c`), grows on demand, and guards its critical section with a
   save-and-restore interrupt disable so the timer IRQ cannot corrupt the free
-  list mid-relink. This is the layer that would implement `mmap`. It now has real
-  callers on the boot path: the heap-allocated `task_t` structs and the
-  per-process `address_space_t` handles. See
+  list mid-relink. It has real callers on the boot path: the heap-allocated
+  `task_t` structs and the per-process `address_space_t` handles. (`SYS_MMAP`
+  sits beside it on the frame allocator directly, not on this heap; the ring-3
+  `malloc` is this same allocator ported a second time.) See
   [reference/heap.md](reference/heap.md) and
   [decisions/0010-kernel-heap-ported-from-p5.md](decisions/0010-kernel-heap-ported-from-p5.md).
+- User memory and a ring-3 libc (`kernel/syscall.c`, `kernel/paging.c`, `libc/`):
+  a program can ask for memory at run time. `SYS_MMAP` maps fresh, zeroed,
+  page-granular regions into a 2MB heap slot at `PD[4]`, placed above every region
+  the task still holds and tracked in a fixed array of eight; `SYS_MUNMAP` releases
+  an exact region and nothing else; a failed map unwinds what it mapped; the
+  teardown frees the slot with the rest of the tree, so ten runs of a program that
+  never frees its slabs leave the free frame count flat. `malloc`/`free`/`calloc`
+  are `kernel/heap.c` ported again on top of it, and `printf` (`%d %u %x %s %c
+  %%`) replaced every hand-rolled number printer in `user/`. `PD[4]` turned out
+  to be the identity map of physical 8-10M, which is now reserved from the frame
+  pool. See [reference/user-memory.md](reference/user-memory.md) and
+  [decisions/0024-user-memory-and-libc.md](decisions/0024-user-memory-and-libc.md).
 
 The kernel builds, links into `townos.elf`, is repackaged as `townos.bin`, and
 boots under QEMU. In the current build `kernel_main` hands off to the scheduler as
@@ -223,7 +243,8 @@ it is running.
   (`TODO(shared-text)`). See
   [decisions/0015-elf-program-loading.md](decisions/0015-elf-program-loading.md).
 - **Demand paging, copy-on-write, and swap.** Per-process paging exists, but every
-  page is mapped eagerly at `task_create_from_file` and backed by real frames. There is no
+  page is mapped eagerly, at `task_create_from_file` for code and stack and at
+  `SYS_MMAP` for the heap, and backed by real frames. There is no
   lazy allocation on fault, no copy-on-write sharing (the read-only user text is
   copied in full per task rather than shared, `TODO(shared-text)`), and no paging
   to disk.
@@ -360,16 +381,30 @@ reader has gone, and Ctrl-D gives the console an end of file. See
 [decisions/0023-signals.md](decisions/0023-signals.md) and
 [reference/signals.md](reference/signals.md).
 
+**User memory and a libc** (`SYS_MMAP`/`SYS_MUNMAP`, `libc/malloc.c`,
+`libc/printf.c`). Done. A program can ask for memory at run time, `malloc` and
+`free` it, and print with `printf`; `libc/` is compiled into ring 3 as well as the
+kernel, and the hand-rolled number printers are gone. See
+[decisions/0024-user-memory-and-libc.md](decisions/0024-user-memory-and-libc.md)
+and [reference/user-memory.md](reference/user-memory.md).
+
+**Phase 1 is complete.** Every rung it set out — boot, memory, interrupts, user
+mode, syscalls, a scheduler, per-process paging, a disk, a filesystem, program
+loading, a shell, blocking, a process lifecycle, writing, descriptors and pipes,
+signals, and now user memory with a libc — is built, documented and tested.
+
 **Next.** The remaining process work the shell makes concrete: argv on the new stack
 so `run` can pass arguments, and `waitpid` so a parent with several children can name
 one (the pipeline shell reaches for it, working around it by matching the reaped
-child's id). Subdirectories and paths are the filesystem's own next rung, and a file
-redirect (`> OUT.TXT`) wants streaming file writes. **Pipes are done**
+child's id). Demand paging is the natural successor to eager `SYS_MMAP` (and would
+give growable stacks), and it changes what a page fault means, which is why it was
+kept out of the libc rung. Subdirectories and paths are the filesystem's own next
+rung, and a file redirect (`> OUT.TXT`) wants streaming file writes. **Pipes are
+done**
 ([decisions/0022-file-descriptors-and-pipes.md](decisions/0022-file-descriptors-and-pipes.md)),
 added exactly as predicted — a new pair of `wait_reason_t` and a waker in the right
-place, no change to the block/wake mechanism. **Signals are done too**, and were the
-last rung of phase 1 before the libc work. Waiting on the disk is the same shape as a
-pipe's block and still a seam.
+place, no change to the block/wake mechanism. **Signals are done too.** Waiting on
+the disk is the same shape as a pipe's block and still a seam.
 
 ## Known limitations
 
@@ -380,11 +415,21 @@ pipe's block and still a seam.
   filenames with `copy_user_string`; `SYS_WRITE` was a start-pointer-only stopgap
   until it became a counted `(fd, buf, len)` call and moved onto `user_range_ok`
   like the rest. What is still missing is that the check tests virtual addresses
-  against the **fixed region constants** (`USER_REGION_START`..`USER_REGION_END`)
+  against the **fixed region constants** (`USER_REGION_START`..`USER_SPACE_END`,
+  4-10M, which since the libc rung includes the heap slot that starts empty)
   rather than walking the caller's own page tables to confirm each page is mapped
   and user-accessible — which is now possible (every task has a private tree) but
-  not implemented. Recorded as a TODO in `kernel/syscall.c`. See
-  [reference/syscalls.md](reference/syscalls.md).
+  not implemented, so an unmapped address inside the span passes the check and
+  faults in the kernel when dereferenced. Recorded as a TODO in `kernel/syscall.c`.
+  See [reference/syscalls.md](reference/syscalls.md).
+- **User memory is eager, region-based, and small.** `SYS_MMAP` maps every page
+  before it returns (no lazy mapping), a task holds at most eight regions, a gap
+  below a live region is never reused, there is no partial or overlapping
+  `SYS_MUNMAP` and no `realloc`, and `malloc` never returns a slab to the kernel,
+  gives 8-byte (not 16-byte) alignment, and is not async-signal-safe. `printf` has
+  no width, precision, length modifiers or floats, and a mismatched format string
+  is undefined beyond the bounds the runtime places on it. See
+  [decisions/0024-user-memory-and-libc.md](decisions/0024-user-memory-and-libc.md).
 - **Blocking is narrow, and signals are a small subset of the real thing.** Task structs
   are heap-allocated and each task now has its own address space with a private
   stack (per-process paging), so the old fixed four-task ceiling and the shared
