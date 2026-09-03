@@ -65,26 +65,6 @@ static char file_buf[SHELL_FILE_MAX];
 // back (unsigned long)-1; name it here so the checks below read as intent.
 #define SYS_FAIL  ((unsigned long)-1)
 
-// A minimal string compare: the freestanding user program has no libc, so this is
-// hand-rolled. Returns 1 when the two NUL-terminated strings are equal.
-static int str_eq(const char *a, const char *b) {
-    while (*a != '\0' && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == *b;   // equal only if both reached '\0' at the same spot
-}
-
-// Length of a NUL-terminated string. `write` needs it to tell the kernel how many
-// bytes of the line to store, and there is no libc strlen to reach for.
-static unsigned long str_len(const char *s) {
-    unsigned long n = 0;
-    while (s[n] != '\0') {
-        n++;
-    }
-    return n;
-}
-
 // Is `name` expressible as an 8.3 name: a base of 1..8 characters, optionally a
 // dot and an extension of 0..3? This mirrors the kernel's name_to_83 acceptance
 // rule (lengths only; it does not judge individual characters), and it lives here
@@ -114,30 +94,6 @@ static int name_is_83(const char *name) {
         }
     }
     return 1;
-}
-
-// Print a small non-negative number in decimal. There is no printf and no libc
-// here, and the only way out is sys_write, which takes a string: so the digits
-// have to be built by hand. Only exit statuses (0..255) go through this, but the
-// buffer is sized for the full range of an unsigned long anyway, because a buffer
-// sized for exactly the values you expect today is how this kind of helper gets
-// overflowed tomorrow.
-//
-// The digits come out least-significant first, so they are written backwards from
-// the end of the buffer and the pointer to the first one is returned. Note the
-// do/while: a plain `while (value)` would print nothing at all for zero, which is
-// the single most common status there is.
-static void print_uint(unsigned long value) {
-    char buf[21];              // 20 digits is the most an unsigned 64-bit value needs, plus '\0'
-    char *p = &buf[20];
-    *p = '\0';
-
-    do {
-        *--p = (char)('0' + (value % 10));
-        value /= 10;
-    } while (value != 0);
-
-    sys_print(p);
 }
 
 static void print_help(void) {
@@ -201,29 +157,23 @@ static void cmd_ps(void) {
         return;
     }
 
-    sys_print("  id  parent  pgid  state    status\n");
+    printf("  id  parent  pgid  state    status\n");
     for (unsigned long i = 0; i < n; i++) {
-        sys_print("  ");
-        print_uint(tasks[i].id);
-        sys_print("   ");
+        printf("  %u   ", tasks[i].id);
         // A task nobody started has no parent to name. The kernel's sentinel for that
         // is 0xFFFFFFFF, which printed as a number is nine digits of noise.
         if (tasks[i].parent_id == 0xFFFFFFFFu) {
-            sys_print("-");
+            printf("-");
         } else {
-            print_uint(tasks[i].parent_id);
+            printf("%u", tasks[i].parent_id);
         }
-        sys_print("       ");
-        print_uint(tasks[i].pgid);
-        sys_print("     ");
-        sys_print(state_name(tasks[i].state));
+        printf("       %u     %s", tasks[i].pgid, state_name(tasks[i].state));
         // Only a zombie has a status worth printing; for anything else the field is 0
         // and means nothing at all.
         if (tasks[i].state == TASK_INFO_ZOMBIE) {
-            sys_print("   ");
-            print_uint((unsigned long)tasks[i].exit_status);
+            printf("   %d", tasks[i].exit_status);
         }
-        sys_print("\n");
+        printf("\n");
     }
 }
 
@@ -301,13 +251,10 @@ static void cmd_read(char *name) {
     // "showing the first N bytes" notice, which only ever fired for a file of
     // exactly the buffer size, which is complete (TODO(read-truncation), now gone).
     if (size > sizeof(file_buf) - 1) {
-        sys_print("read: ");
-        sys_print(name);
-        sys_print(" is ");
-        print_uint(size);
-        sys_print(" bytes, the buffer holds ");
-        print_uint(sizeof(file_buf) - 1);
-        sys_print("\n");
+        // The casts are because this printf has no length modifiers (%lu): a file
+        // on a 64MB volume is well under 4GB, so an unsigned int holds either number.
+        printf("read: %s is %u bytes, the buffer holds %u\n", name,
+               (unsigned int)size, (unsigned int)(sizeof(file_buf) - 1));
         return;
     }
 
@@ -347,7 +294,7 @@ static void cmd_write(char *name, char *content) {
         sys_print(" is not an 8.3 name (max 8 chars, dot, 3 chars)\n");
         return;
     }
-    if (sys_writefile(name, content, str_len(content)) != 0) {
+    if (sys_writefile(name, content, strlen(content)) != 0) {
         sys_print("write: could not write ");
         sys_print(name);
         sys_print("\n");
@@ -361,8 +308,7 @@ static void cmd_write(char *name, char *content) {
 // count drifting down. fat32_free_count recounts the whole FAT, so it is honest
 // rather than a cached total that a leak could hide behind.
 static void cmd_free(void) {
-    print_uint(sys_freecount());
-    sys_print(" clusters free\n");
+    printf("%u clusters free\n", (unsigned int)sys_freecount());
 }
 
 // `delete <file>`: remove a file from the disk.
@@ -442,11 +388,7 @@ static void cmd_run(char *name) {
         return;
     }
 
-    sys_print("run: ");
-    sys_print(name);
-    sys_print(" exited with status ");
-    print_uint((unsigned long)status);
-    sys_print("\n");
+    printf("run: %s exited with status %d\n", name, (int)status);
 }
 
 static void cmd_clear(void) {
@@ -533,18 +475,6 @@ static void read_line(void) {
     line[len] = '\0';
 }
 
-// Does the line contain a '|'? That is what routes it to the pipeline path; a line
-// with no '|' takes exactly the single-command path it always has.
-static int line_has_pipe(const char *s) {
-    while (*s != '\0') {
-        if (*s == '|') {
-            return 1;
-        }
-        s++;
-    }
-    return 0;
-}
-
 // Start one pipeline stage. A stage must be `run <file>` — the other commands are
 // shell builtins that write to the shell's own console rather than to a child, so
 // they cannot be a stage. `in_fd`/`out_fd` are the descriptors the child gets as its
@@ -553,7 +483,7 @@ static int line_has_pipe(const char *s) {
 static long start_segment(char *seg, int in_fd, int out_fd, unsigned long pgid) {
     char *pos = seg;
     char *cmd = next_token(&pos, ' ');
-    if (cmd == (char *)0 || !str_eq(cmd, "run")) {
+    if (cmd == (char *)0 || strcmp(cmd, "run") != 0) {
         sys_print("pipe: each stage must be 'run <file>'\n");
         return -1;
     }
@@ -682,9 +612,7 @@ drain:
             }
         }
         if (last_id >= 0 && last_status >= 0) {
-            sys_print("pipeline exited with status ");
-            print_uint((unsigned long)last_status);
-            sys_print("\n");
+            printf("pipeline exited with status %d\n", (int)last_status);
         }
     }
 
@@ -738,7 +666,7 @@ void _start(void) {
         // single-command path below, unchanged. The single-command case is NOT routed
         // through the pipeline machinery, so a plain `run a.elf` still behaves exactly
         // as it did before pipes existed.
-        if (line_has_pipe(line)) {
+        if (strchr(line, '|') != NULL) {
             run_pipeline();
             continue;
         }
@@ -752,32 +680,32 @@ void _start(void) {
             continue;   // empty line (or only spaces): reprint the prompt
         }
 
-        if (str_eq(cmd, "list")) {
+        if (strcmp(cmd, "list") == 0) {
             cmd_list();
-        } else if (str_eq(cmd, "read")) {
+        } else if (strcmp(cmd, "read") == 0) {
             cmd_read(next_token(&pos, ' '));
-        } else if (str_eq(cmd, "write")) {
+        } else if (strcmp(cmd, "write") == 0) {
             // Extract the filename FIRST, then hand cmd_write the raw remainder as
             // the contents. Two statements, not one call: C leaves argument
             // evaluation order unspecified, and `pos` must be read only after
             // next_token has advanced it past the filename.
             char *wname = next_token(&pos, ' ');
             cmd_write(wname, pos);
-        } else if (str_eq(cmd, "delete")) {
+        } else if (strcmp(cmd, "delete") == 0) {
             cmd_delete(next_token(&pos, ' '));
-        } else if (str_eq(cmd, "free")) {
+        } else if (strcmp(cmd, "free") == 0) {
             cmd_free();
-        } else if (str_eq(cmd, "run")) {
+        } else if (strcmp(cmd, "run") == 0) {
             cmd_run(next_token(&pos, ' '));
-        } else if (str_eq(cmd, "help")) {
+        } else if (strcmp(cmd, "help") == 0) {
             print_help();
-        } else if (str_eq(cmd, "clear")) {
+        } else if (strcmp(cmd, "clear") == 0) {
             cmd_clear();
-        } else if (str_eq(cmd, "return")) {
+        } else if (strcmp(cmd, "return") == 0) {
             cmd_return(pos);   // the raw remainder after the "return" token
-        } else if (str_eq(cmd, "ps")) {
+        } else if (strcmp(cmd, "ps") == 0) {
             cmd_ps();
-        } else if (str_eq(cmd, "kill")) {
+        } else if (strcmp(cmd, "kill") == 0) {
             char *id_tok = next_token(&pos, ' ');
             char *sig_tok = next_token(&pos, ' ');
             cmd_kill(id_tok, sig_tok);

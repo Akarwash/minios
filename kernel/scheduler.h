@@ -33,6 +33,19 @@
 // of open descriptors is not something this kernel runs.
 #define MAX_FDS 8
 
+// How many SYS_MMAP regions a task can hold at once, and the record of one. A
+// FIXED ARRAY RATHER THAN A LINKED LIST, on purpose: a list of memory regions would
+// need somewhere to allocate its nodes from, in the middle of the thing that hands
+// out memory, and a fixed array cannot fragment its own bookkeeping. Eight is
+// plenty for a malloc that grows its slab a few times; a program that needs more
+// gets SYSCALL_ERROR from SYS_MMAP rather than a quietly growing structure.
+#define MAX_REGIONS 8
+
+typedef struct {
+    uint64_t base;        // page-aligned start, inside the heap slot (include/usermem.h)
+    uint64_t length;      // whole pages; 0 means the slot is unused
+} region_t;
+
 // Report every lifecycle event that returns memory to the pools, with the free
 // frame count after it. Set to 0 to silence the lot.
 //
@@ -195,6 +208,14 @@ typedef struct task {
     // is an index into THIS task's table only — it means nothing in another task's.
     // See kernel/file.h and docs/reference/descriptors.md.
     file_t *fds[MAX_FDS];
+
+    // The SYS_MMAP regions this task holds, in no particular order; a slot with
+    // length 0 is free. The kernel reads this for exactly ONE purpose: to validate a
+    // SYS_MUNMAP, so a program can release only what it was given and nothing else
+    // (M4 in docs/decisions/0024). Freeing at exit does NOT walk it:
+    // paging_destroy_address_space frees the whole heap slot by page-directory
+    // index, so a region a program forgot to release comes back regardless.
+    region_t regions[MAX_REGIONS];
 } task_t;
 
 // Forge a never-run task from a program FILE: read `name` (an 8.3 filename such

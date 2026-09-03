@@ -32,6 +32,46 @@ corrected on sight, or the source.
 
 ### Added
 
+- User memory, the last rung of phase 1: a ring-3 program can ask for memory at
+  run time. `SYS_MMAP` (19) maps `length` bytes of fresh, zeroed, anonymous memory
+  into a new heap slot at `PD[4]` (`0x800000`-`0x9FFFFF`, 2MB) and returns its
+  page-aligned address; `SYS_MUNMAP` (20) releases a region, and only an exact
+  region: the kernel tracks each task's regions in a fixed array of eight and
+  refuses an address that is not a region's start with that region's length. Eager
+  mapping, no file mapping, no sharing, no protection flags; twenty-one calls in
+  all. The layout is stated once, in a new `include/usermem.h`, shared by the
+  kernel and by programs. `paging_map_user_range` unwinds every page it mapped when
+  a frame or page table runs out, `paging_unmap_user_range` flushes each page from
+  the TLB, and the teardown's list of user page-directory slots is now a single
+  three-entry array read by both the clone and the free, so a region a program
+  never released comes back at exit with everything else.
+- **`PD[4]` was not a free slot**: it was the boot identity map of physical 8-10M,
+  the first range the frame allocator hands out. `memory_init` now reserves those
+  512 frames along with 4-8M, and the kernel clone leaves the slot absent. The
+  free-frame baseline on the reap line dropped from 30585 to about 30072.
+- A ring-3 `malloc`, `free` and `calloc` in `libc/malloc.c`: `kernel/heap.c`
+  ported a second time, on `SYS_MMAP`, with every function name unchanged so the
+  two copies can be diffed. 64KB slabs, adjacency checked on growth (a
+  non-adjacent slab is given back and `malloc` returns NULL), slabs never returned,
+  8-byte alignment, no interrupt guard so not async-signal-safe, the heap built
+  from inside the first `malloc` with nothing on that path allocating.
+- `printf` in `libc/printf.c`: `%d %u %x %s %c %%` and nothing else, built on a new
+  `sys_write_all` partial-write loop shared with `sys_print`. An unrecognised
+  specifier stops the format and returns -1; `%s` validates its pointer against the
+  ring-3 address space before dereferencing. Declared in `user/userlib.h` with
+  `__attribute__((format(printf, 1, 2)))`, which is the real defence against a
+  mismatched format string.
+- `strchr`, `memcmp` and `memmove` in `libc/`, each for code that was open-coding
+  it (the shell's pipe test, `fs/fat32.c`'s 8.3 name compare, the screen scroll),
+  and `libc/` now compiled twice: the kernel objects as before and `.user.o`
+  objects linked into every ring-3 program, which is how any of it reaches ring 3.
+- Three fixtures: `I.ELF` (300 `malloc` blocks, patterns, shuffled frees, a
+  200000-byte reuse across slab boundaries, `calloc`, a refused 3MB), `J.ELF`
+  (every `SYS_MMAP`/`SYS_MUNMAP` abuse refused with memory intact), `K.ELF` (every
+  `printf` specifier with its return value checked, plus the designed failures).
+- `docs/decisions/0024-user-memory-and-libc.md`, with the six ways this goes
+  wrong (M1-M6), and `docs/reference/user-memory.md`.
+
 - Signals, the last rung of phase 1: a way to interrupt a running ring-3 program,
   and to have it resume afterwards. **A signal is what an interrupt is, one layer
   up, and no hardware does any of it** — every step the CPU performs for an
@@ -883,6 +923,17 @@ corrected on sight, or the source.
 
 ### Fixed
 
+- `make disk-programs` now depends on `townos.bin`, so refreshing the disk image
+  can no longer boot a stale kernel with fresh programs, which produced one
+  false-positive test result in the signals rung.
+- `drivers/screen.c`'s scroll copied overlapping ranges with `memcpy`, which
+  worked only because the copy happens to run forward; it uses `memmove`.
+- `docs/reference/boot-sequence.md` and `docs/project-status.md` said the boot
+  identity map was the first 8MB. It has been 32MB (`PD[0..15]`, four entries
+  written explicitly and twelve by a loop) since the Multiboot rung; the figure
+  had been copied from the original decision rather than from `boot/boot.asm`.
+  ADR 0002 keeps its name and body and gains a Status note.
+
 - `make` with no target now builds the kernel. It had been reporting
   `user/SHELL.ELF is up to date` and building nothing else: GNU make takes the
   first explicit target in the file as its default goal, and the explicit
@@ -1022,6 +1073,16 @@ under QEMU, with the timer and keyboard driving interrupts.
 - Root `CHANGELOG.md`.
 
 ### Changed
+
+- `user_range_ok` and `copy_user_string` bound a ring-3 pointer against the top of
+  the heap slot (4-10M) rather than the top of the stack (4-8M), so a malloc'd
+  buffer can be handed to a syscall. The check is still region-based, not per-page.
+- `user/shell.c` lost `print_uint`, `str_eq`, `str_len` and `line_has_pipe`
+  (`printf`, `strcmp`, `strlen`, `strchr`); `COUNT.c`, `H.c` and `ONCE.c` lost their
+  `print_ulong`. `strlen` and `strcmp` take `const` pointers; `memcpy` and `memset`
+  return the destination and `memset` takes an `int`.
+- User programs grew from about 13KB to about 22KB, since the libc objects are
+  linked into each and nothing is garbage-collected at link.
 
 - Migrated the codebase from 32-bit i686 to x86-64: `Makefile` toolchain and
   flags (`-m64 -mno-red-zone -mcmodel=kernel`, `nasm -f elf64`), `include/types.h`

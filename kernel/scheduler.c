@@ -205,6 +205,14 @@ static int task_register(address_space_t *as, uint64_t entry, uint32_t parent_id
     }
     t->fds[0] = fd_in;
     t->fds[1] = fd_out;
+
+    // No SYS_MMAP regions yet. kmalloc does not zero, so every slot is marked free
+    // by hand; a stale length here would make SYS_MMAP think the slot is taken and,
+    // worse, make SYS_MUNMAP accept an address that was never mapped.
+    for (int i = 0; i < MAX_REGIONS; i++) {
+        t->regions[i].base = 0;
+        t->regions[i].length = 0;
+    }
     return (int)id;
 }
 

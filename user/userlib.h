@@ -11,15 +11,26 @@
 // fault. The ONLY channel across the ring boundary is `int 0x50`, the syscall
 // gate, and this header is the whole of the user side of it.
 //
-// The two headers included below are the only things a user program is allowed
-// to lean on, and both are deliberately standalone (numbers only, no kernel
-// code, no types):
-//   include/syscalls.h  the syscall numbers (SYS_WRITE, SYS_EXIT)
+// The headers included below are the only things a user program is allowed to
+// lean on, and all of them are deliberately standalone (numbers and plain types
+// only, no kernel code):
+//   include/syscalls.h  the syscall numbers (SYS_WRITE, SYS_EXIT, ...)
 //   include/vectors.h   the vector to raise (SYSCALL_VECTOR)
+//   include/signals.h   the signal numbers
+//   include/usermem.h   the ring-3 address-space layout SYS_MMAP hands out from
+//   include/types.h     the fixed-width integer types and size_t
+// plus the two halves of libc that are compiled into every program as well as
+// into the kernel (see USER_LIBC_SOURCES in the Makefile):
+//   libc/string.h       strlen, strcmp, strcpy, strchr
+//   libc/mem.h          memcpy, memmove, memset, memcmp
 
+#include "../include/types.h"
 #include "../include/syscalls.h"
 #include "../include/vectors.h"
 #include "../include/signals.h"
+#include "../include/usermem.h"
+#include "../libc/string.h"
+#include "../libc/mem.h"
 
 // The raw doorbell. `int $SYSCALL_VECTOR` traps into the kernel's DPL 3 gate.
 // Convention (see include/syscalls.h): RAX = syscall number, RDI = first arg,
@@ -117,27 +128,33 @@ long sys_write(int fd, const char *buf, unsigned long len) {
     return (long)syscall3(SYS_WRITE, (unsigned long)fd, (unsigned long)buf, len);
 }
 
-// Print a NUL-terminated string to fd 1 (standard output), looping until the whole
-// string is written. THE LOOP IS THE POINT: sys_write may move fewer bytes than
-// asked, so one call is never assumed to have moved everything. Returns the number
-// of bytes written (short only if the descriptor went away mid-write). This is the
-// replacement for the old single-argument sys_write, so the common "print this
-// string" call sites read the same and cannot forget the loop.
+// Write all `len` bytes of `buf` to `fd`, looping until everything is written.
+// THE LOOP IS THE POINT: sys_write may move fewer bytes than asked (a pipe takes
+// only what fits; the console moves at most the kernel's staging buffer per call),
+// so one call is never assumed to have moved everything. Returns the number of
+// bytes written, short only if the descriptor went away mid-write (a write
+// returning <= 0), which is the one reason to stop. sys_print and printf are both
+// built on this one loop, so neither can forget it.
 static inline __attribute__((always_inline))
-long sys_print(const char *s) {
-    unsigned long n = 0;
-    while (s[n] != '\0') {
-        n++;
-    }
+long sys_write_all(int fd, const char *buf, unsigned long len) {
     unsigned long done = 0;
-    while (done < n) {
-        long w = sys_write(1, s + done, n - done);
+    while (done < len) {
+        long w = sys_write(fd, buf + done, len - done);
         if (w <= 0) {
             return (long)done;   // far end gone or error: stop, report progress
         }
         done += (unsigned long)w;
     }
     return (long)done;
+}
+
+// Print a NUL-terminated string to fd 1 (standard output), looping until the whole
+// string is written (see sys_write_all). Returns the number of bytes written. This
+// is the replacement for the old single-argument sys_write, so the common "print
+// this string" call sites read the same and cannot forget the loop.
+static inline __attribute__((always_inline))
+long sys_print(const char *s) {
+    return sys_write_all(1, s, strlen(s));
 }
 
 // SYS_READ: read up to `len` bytes from descriptor `fd` into `buf`. Returns the
@@ -367,6 +384,89 @@ static inline __attribute__((always_inline))
 unsigned long sys_kill(unsigned long id, int sig) {
     return syscall2(SYS_KILL, id, (unsigned long)sig);
 }
+
+// SYS_MMAP: ask the kernel for `length` bytes of fresh memory. Returns the
+// page-aligned address of a new region inside the heap slot (USER_HEAP_BASE up to
+// USER_HEAP_LIMIT, include/usermem.h), or (unsigned long)-1. The memory is ZEROED
+// and mapped in full before the call returns (nothing is lazy), and `length` is
+// rounded up to whole pages, so asking for 100 bytes costs 4096. Anonymous memory
+// only: no file behind it, no sharing, no protection flags.
+//
+// A region is placed at the lowest address above every region this program still
+// holds. Space freed BELOW a live region is not reused in this rung, so a program
+// that keeps one region and maps and unmaps repeatedly above it climbs the 2MB slot
+// and eventually gets -1. Each program may hold at most eight regions at once. This
+// is the call malloc (libc/malloc.c) is built on; most programs never call it
+// directly. Does not block.
+static inline __attribute__((always_inline))
+unsigned long sys_mmap(unsigned long length) {
+    return syscall1(SYS_MMAP, length);
+}
+
+// SYS_MUNMAP: release a region SYS_MMAP handed out, and only that: `addr` must be
+// exactly the address SYS_MMAP returned and `length` the length asked of it (the
+// kernel rounds it up to pages the same way). Returns 0, or (unsigned long)-1 when
+// (addr, length) is not exactly a region this program holds: an address it never
+// mapped, its own code or stack, part of a region, or a region it already released.
+// A refused call changes nothing. There is no partial or overlapping unmap in this
+// rung. Does not block.
+static inline __attribute__((always_inline))
+unsigned long sys_munmap(unsigned long addr, unsigned long length) {
+    return syscall2(SYS_MUNMAP, addr, length);
+}
+
+// ============================================================================
+// The heap: malloc, free, calloc (libc/malloc.c, linked into every program).
+// ============================================================================
+// A program can ask for memory at runtime instead of declaring every buffer as a
+// fixed static array. The allocator is kernel/heap.c ported a second time (the
+// same p5 explicit free list with boundary tags and coalescing), sitting on
+// SYS_MMAP instead of the frame allocator. The first call maps a 64KB slab at the
+// bottom of the heap slot; running out maps another, adjacent, slab, up to the
+// kernel's eight-region cap; a slab is never given back until the program exits.
+//
+// Contract, and its edges:
+//   - malloc(n) returns 8-byte aligned memory that holds n bytes, or NULL when the
+//     kernel refuses another slab (out of frames, out of region slots, or the 2MB
+//     ceiling). A fresh slab arrives zeroed from the kernel, but a REUSED block
+//     holds whatever its last owner left: use calloc if zero matters.
+//   - free(p) returns a block to the allocator, coalescing with its neighbours;
+//     free(NULL) does nothing. Freeing anything malloc did not return, or freeing
+//     twice, corrupts the heap (the allocator prints one ERROR line for the cases
+//     it can detect and does nothing for the rest).
+//   - calloc(count, size) is malloc(count * size) with the product checked for
+//     overflow and the memory cleared.
+//   - There is no realloc in this rung.
+//   - Not async-signal-safe: a signal handler must not call any of these.
+// See libc/malloc.c, docs/reference/user-memory.md and docs/decisions/0024.
+void *malloc(size_t size);
+void  free(void *ptr);
+void *calloc(size_t count, size_t size);
+
+// ============================================================================
+// printf (libc/printf.c, linked into every program).
+// ============================================================================
+// Formatted output to fd 1. Six specifiers and nothing else: %d (int), %u
+// (unsigned int), %x (unsigned int, lowercase hex, no prefix), %s (a NUL-terminated
+// string), %c (a character), %% (a percent sign). No width, no precision, no
+// length modifiers, no floats; more get added when something needs them. Returns
+// the number of bytes written, or -1.
+//
+// An unrecognised specifier STOPS THE FORMAT: what came before it is written,
+// nothing after it is, and the call returns -1. It is neither printed raw nor
+// skipped. A %s whose pointer lies outside the ring-3 address space is refused the
+// same way, before anything reads through it. Output goes through sys_write_all,
+// so a long line into a full pipe waits rather than truncates.
+//
+// THE FORMAT ATTRIBUTE IS THE REAL DEFENCE against a format string that does not
+// match its arguments, which cannot be detected at run time (printf("%s %s", one)
+// reads a second argument that was never passed): the compiler checks every call
+// site against the format string and warns on a mismatch. A mismatched format that
+// gets past it is undefined behaviour. Two edges the compiler cannot flag, because
+// they are valid for the standard printf: a length modifier (%lu, %ld) is not a
+// specifier this printf knows, so it stops the format at run time; cast the value to
+// unsigned int or int at the call site instead. And %p does not exist here.
+int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // A crude busy-wait so the letters do not scroll past faster than the eye can
 // follow. This is NOT a timed delay, just a spin; the count was tuned by eye

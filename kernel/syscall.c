@@ -10,7 +10,9 @@
 #include "../libc/mem.h"
 #include "../include/syscalls.h"
 #include "signal.h"
+#include "paging.h"
 #include "../include/taskinfo.h"
+#include "../include/usermem.h"
 
 // The most bytes one SYS_READ or SYS_WRITE moves in a single call. A counted
 // buffer from ring 3 is copied through a kernel staging buffer of this size, so a
@@ -33,19 +35,21 @@ static char io_staging[SYSCALL_IO_MAX];
 // Copy a NUL-terminated string from ring 3 into a kernel buffer, capping the
 // length so a missing terminator cannot walk out of the region. The start pointer
 // is bounds-checked; then bytes are copied until a NUL, until dst_size is reached,
-// or until USER_REGION_END is reached, whichever comes first. The result is always
+// or until USER_SPACE_END is reached, whichever comes first. The result is always
 // NUL-terminated. Returns 0 on success, -1 if the start pointer is out of bounds or
-// no terminator appears within the cap.
+// no terminator appears within the cap. The bound is the same one user_range_ok
+// uses (the top of the heap slot), so a filename living in malloc'd memory is
+// accepted like one in .rodata.
 static int copy_user_string(uint64_t user_ptr, char *dst, uint32_t dst_size) {
     if (dst_size == 0) {
         return -1;
     }
-    if (user_ptr < USER_REGION_START || user_ptr >= USER_REGION_END) {
+    if (user_ptr < USER_REGION_START || user_ptr >= USER_SPACE_END) {
         return -1;
     }
     for (uint32_t i = 0; i < dst_size; i++) {
         uint64_t addr = user_ptr + i;
-        if (addr >= USER_REGION_END) {
+        if (addr >= USER_SPACE_END) {
             return -1;   // reached the region edge with no terminator
         }
         char c = *(const char *)addr;
@@ -619,6 +623,148 @@ static uint64_t sys_kill(uint64_t id, uint64_t sig) {
     return 0;
 }
 
+// ============================================================================
+// SYS_MMAP and SYS_MUNMAP: anonymous memory for ring 3.
+// ============================================================================
+// A program's address space used to be exactly what its ELF file declared plus a
+// stack. These two calls let it ask for more at runtime, one page-aligned region at
+// a time, inside the heap slot PD[4] (include/usermem.h). Anonymous only: no file
+// mapping, no sharing, no protection flags. That is the subset malloc uses. See
+// docs/decisions/0024-user-memory-and-libc.md.
+//
+// NEITHER BLOCKS, so neither has the RAX-discipline problem SYS_READKEY, SYS_READ,
+// SYS_WRITE and SYS_WAIT carry (leave rax alone on the path that parks the task,
+// because the re-armed `int 0x50` reads the syscall number back out of it). Both
+// compute an answer and hand it to the dispatcher to store, like SYS_STAT. Worth
+// naming, since the asymmetry between the two kinds of call is easy to forget and
+// the consequence of forgetting it is a woken task issuing the wrong syscall.
+//
+// The kernel tracks what it handed out in task_t.regions, a small fixed array. It
+// is read for exactly one thing: validating SYS_MUNMAP (M4 below). Cleanup at exit
+// does not read it at all; paging_destroy_address_space frees the whole heap slot
+// by page-directory index, so a region a program forgot to release comes back with
+// everything else (M2 in the ADR, and the comment on the slot list in paging.c).
+
+// Round a byte count up to whole pages. Callers reject a length that could wrap
+// here BEFORE calling this, so the addition cannot overflow.
+static uint64_t round_up_to_page(uint64_t n) {
+    return (n + USER_PAGE_SIZE - 1) & ~(USER_PAGE_SIZE - 1);
+}
+
+// SYS_MMAP: map `length` bytes of fresh, zeroed memory into the caller's heap slot.
+//   RDI = length in bytes.
+// Returns the page-aligned base of the new region, or SYSCALL_ERROR.
+//
+// PLACEMENT: the lowest page-aligned address above every region the task still
+// holds, starting at USER_HEAP_BASE. A gap left by a SYS_MUNMAP BELOW a live region
+// is never reused in this rung; only the space above the highest live region is.
+// That is deliberate and recorded in the ADR: a program that keeps one region and
+// maps and unmaps repeatedly above it climbs the slot and exhausts the 2MB even
+// though almost none of it is in use. Reusing gaps is what a real allocator's
+// region list does and what a later rung would add.
+//
+// M1, THE CONFUSED DEPUTY: `length` came from ring 3, and this call maps pages on
+// request. Without the checks below a program could ask for a length that pushes
+// the region over the top of PD[4] into kernel-only addresses (the mapping would be
+// installed with the user bit set, in a slot the clone left empty for the kernel,
+// with no fault until something used it), or ask for enough that the frame
+// allocator runs dry and the next page-table allocation for another task fails.
+// So: zero is refused, anything over the slot is refused before rounding (so the
+// rounding cannot overflow), a region that would cross USER_HEAP_LIMIT is refused,
+// and the running total across the task's regions is checked against the slot as
+// well. The total is redundant with the ceiling check while placement is "above
+// every live region", and is kept so it stays correct if gap reuse is ever added.
+static uint64_t sys_mmap(uint64_t length) {
+    task_t *t = scheduler_current_task();
+    const uint64_t slot_bytes = USER_HEAP_LIMIT - USER_HEAP_BASE;
+
+    if (length == 0 || length > slot_bytes) {
+        print_string("syscall: SYS_MMAP rejected a length outside the 2MB heap slot\n");
+        return SYSCALL_ERROR;
+    }
+    length = round_up_to_page(length);
+
+    // Find the first free slot and the lowest address above every live region.
+    int slot = -1;
+    uint64_t next = USER_HEAP_BASE;
+    uint64_t total = 0;
+    for (int i = 0; i < MAX_REGIONS; i++) {
+        if (t->regions[i].length == 0) {
+            if (slot < 0) {
+                slot = i;
+            }
+            continue;
+        }
+        uint64_t end = t->regions[i].base + t->regions[i].length;
+        if (end > next) {
+            next = end;
+        }
+        total += t->regions[i].length;
+    }
+    if (slot < 0) {
+        print_string("syscall: SYS_MMAP rejected: no free region slot\n");
+        return SYSCALL_ERROR;
+    }
+    if (length > USER_HEAP_LIMIT - next) {
+        print_string("syscall: SYS_MMAP rejected a region that would cross the 2MB ceiling\n");
+        return SYSCALL_ERROR;
+    }
+    if (total + length > slot_bytes) {
+        print_string("syscall: SYS_MMAP rejected: the task's regions would exceed the slot\n");
+        return SYSCALL_ERROR;
+    }
+
+    // M3 lives inside paging_map_user_range: a failure part way unwinds every page
+    // it had mapped, so a SYSCALL_ERROR here has cost the task nothing.
+    if (paging_map_user_range(t->aspace, next, length) != 0) {
+        print_string("syscall: SYS_MMAP failed: out of frames\n");
+        return SYSCALL_ERROR;
+    }
+
+    t->regions[slot].base = next;
+    t->regions[slot].length = length;
+    return next;
+}
+
+// SYS_MUNMAP: release a region SYS_MMAP handed out.
+//   RDI = address, RSI = length in bytes.
+// Returns 0, or SYSCALL_ERROR if (addr, length) is not exactly a region this task
+// holds. `length` is rounded up to whole pages the same way SYS_MMAP rounded it, so
+// a program may release with the number it asked for or the number it got.
+//
+// M4, THE ADDRESS IS NOT TRUSTED: the address came from ring 3, and this call frees
+// frames and clears mappings. Without the lookup below a program could pass its
+// own code or stack address, or an address it invented, and the kernel would unmap
+// and free frames that belong to the program's text or stack (or, worse, nothing
+// it could sensibly fault on until the frames were reissued to another task and
+// overwritten). So the only thing this call will unmap is a region whose recorded
+// base and length match EXACTLY. No partial unmap, no overlapping unmap, no unmap
+// spanning two regions; each is refused and changes nothing. That is a limitation
+// as well as a defence, and the ADR says so.
+static uint64_t sys_munmap(uint64_t addr, uint64_t length) {
+    task_t *t = scheduler_current_task();
+
+    if (length == 0 || length > USER_HEAP_LIMIT - USER_HEAP_BASE) {
+        print_string("syscall: SYS_MUNMAP rejected a length outside the heap slot\n");
+        return SYSCALL_ERROR;
+    }
+    length = round_up_to_page(length);
+
+    for (int i = 0; i < MAX_REGIONS; i++) {
+        if (t->regions[i].length == 0) {
+            continue;
+        }
+        if (t->regions[i].base == addr && t->regions[i].length == length) {
+            paging_unmap_user_range(t->aspace, addr, length);
+            t->regions[i].base = 0;
+            t->regions[i].length = 0;   // 0 means the slot is free again
+            return 0;
+        }
+    }
+    print_string("syscall: SYS_MUNMAP rejected an address that is not a region's start\n");
+    return SYSCALL_ERROR;
+}
+
 // Map a kernel task state onto the number that crosses the ring boundary. The two
 // are deliberately different vocabularies (see include/taskinfo.h): this switch is
 // where a new internal state has to be considered rather than leaking out with
@@ -734,6 +880,12 @@ void syscall_handler(registers_t *regs) {
             break;
         case SYS_SIGRETURN:
             sys_sigreturn(regs);   // rewrites the whole pile; deliberately not `regs->rax = ...`
+            break;
+        case SYS_MMAP:
+            regs->rax = sys_mmap(regs->rdi);
+            break;
+        case SYS_MUNMAP:
+            regs->rax = sys_munmap(regs->rdi, regs->rsi);
             break;
         default:
             print_string("syscall: unknown number ");

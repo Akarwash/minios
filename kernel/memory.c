@@ -170,11 +170,30 @@ void memory_init(uint64_t mbi_addr) {
         num_frames = MAX_FRAMES;
     }
 
-    // Reserve the ring-3 region (4-8M): those frames hold the live user program
-    // and its stacks, so handing them out would corrupt running code. Regions
-    // below MEMORY_START (real-mode area, kernel image at 1M) are already outside
-    // the pool and need no explicit reservation.
-    reserve_range(USER_REGION_START, USER_REGION_END);
+    // Reserve the physical frames under the three ring-3 slots, 4-10M.
+    //
+    // 4-8M is historical: those frames held the live user program and its stacks
+    // when the boot tree's user huge pages were the only user mapping, and the
+    // reservation was never lifted. 8-10M IS NEW AND LOAD-BEARING. boot/boot.asm
+    // identity-maps physical 8-10M through PD[4], and PD[4] is now every task's
+    // PRIVATE heap slot (kernel/paging.c leaves it absent in the kernel clone and
+    // SYS_MMAP fills it with 4KB user pages). The kernel reaches every frame it
+    // owns through the identity map, and after scheduler_start the identity map
+    // it walks is whichever task tree is in CR3, so a kernel pointer into physical
+    // 8-10M no longer reaches physical 8-10M: it resolves through that task's heap
+    // page table, or faults on an empty slot.
+    //
+    // WHAT BREAKS WITHOUT THIS LINE: alloc_frame hands out the lowest free frame,
+    // and with only 4-8M reserved that is 0x800000 itself. The first task's PML4
+    // (or the kernel heap's slab) would be placed at physical 8M, addressed as
+    // 0x800000, and the moment a task tree with an absent PD[4] was loaded every
+    // kernel access to it would fault; with a heap page mapped there instead, the
+    // kernel would silently read and write a ring-3 program's malloc'd memory in
+    // place of its own page tables. Keeping these 512 frames out of the pool is
+    // what makes the private heap slot and the identity map able to coexist.
+    // Regions below MEMORY_START (real-mode area, kernel image at 1M) are already
+    // outside the pool and need no explicit reservation.
+    reserve_range(USER_REGION_START, USER_HEAP_LIMIT);
 
     // Reserve everything the map flagged as non-usable that falls inside the pool.
     reserve_map_holes(mbi_addr);

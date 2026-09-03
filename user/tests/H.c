@@ -30,17 +30,6 @@
 // to cache the value in a register and print a stale one at the end.
 static volatile unsigned long handled;
 
-static void print_ulong(unsigned long v) {
-    char buf[21];
-    int i = 20;
-    buf[i] = '\0';
-    do {
-        buf[--i] = (char)('0' + (v % 10));
-        v /= 10;
-    } while (v != 0);
-    sys_print(&buf[i]);
-}
-
 // The SIG_INT handler. `sig` is the signal number the kernel passed in RDI; it is
 // unused because this program only ever registers one handler, and naming it keeps
 // the signature the one sys_signal expects.
@@ -66,8 +55,6 @@ void _start(void) {
 
     // The count is the point. It says how many times the loop was interrupted and
     // resumed, and that it ran all forty rounds regardless.
-    sys_print("\nH: finished, caught ");
-    print_ulong(handled);
-    sys_print(" interrupts\n");
+    printf("\nH: finished, caught %u interrupts\n", (unsigned int)handled);
     sys_exit(0);
 }

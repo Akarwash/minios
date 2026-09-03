@@ -20,17 +20,6 @@
 
 #include "../userlib.h"
 
-static void print_ulong(unsigned long v) {
-    char buf[21];
-    int i = 20;
-    buf[i] = '\0';
-    do {
-        buf[--i] = (char)('0' + (v % 10));
-        v /= 10;
-    } while (v != 0);
-    sys_print(&buf[i]);
-}
-
 void _start(void) {
     char buf[64];
 
@@ -40,8 +29,6 @@ void _start(void) {
         sys_exit(1);
     }
 
-    sys_print("ONCE: read ");
-    print_ulong((unsigned long)n);
-    sys_print(" bytes, exiting\n");
+    printf("ONCE: read %u bytes, exiting\n", (unsigned int)n);
     sys_exit(0);
 }

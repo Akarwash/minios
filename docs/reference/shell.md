@@ -43,7 +43,7 @@ the shell before the syscall, because that failure is the user's and fixable by
 retyping — the one case worth telling apart from a disk error. See
 [decision 0020](../decisions/0020-writable-fat32.md).
 
-**Command names are case-SENSITIVE and filenames are not.** `str_eq` compares
+**Command names are case-SENSITIVE and filenames are not.** `strcmp` compares
 bytes, so `RUN a.elf` prints `unknown command: RUN`, while `run A.ELF` and
 `run a.elf` both work because the FAT32 layer uppercases the name before looking
 it up. This is only reachable now that shift exists (see
@@ -274,11 +274,13 @@ reaches one the keyboard cannot (see [Signals at the prompt](#signals-at-the-pro
 below). The fixtures keep their bounded loops, which are now a convenience rather
 than a necessity.
 
-**Printing the status needs a number printer.** There is no libc and the only way
-out is `SYS_WRITE`, which takes a string, so `user/shell.c` has a small
-`print_uint` that builds the digits backwards into a stack buffer. Its `do`/`while`
-is deliberate: a plain `while (value)` prints nothing for zero, which is the most
-common status there is.
+**Printing the status uses `printf`.** The shell used to carry its own
+`print_uint`, ten call sites of a hand-built decimal conversion, because there was
+no libc to reach for, and three fixtures carried the same dozen lines again under
+another name. `printf` (`libc/printf.c`, linked into every program) replaced all
+four. It supports `%d %u %x %s %c %%` and nothing else, so an `unsigned long` size
+or count is cast to `unsigned int` at the call site. See
+[user-memory.md](user-memory.md).
 
 **The untrusted pointers.** Every pointer these take comes from ring 3 and is
 checked before the kernel touches it. Buffers go through `user_range_ok`, which
@@ -338,6 +340,15 @@ name in the root, so `run a.elf` finds them (the lookup is case-insensitive).
 | `E.ELF` | prints `E` 15 times | 7 | the orphan nobody reaps |
 | `H.ELF` | prints `H` 40 times, catches `SIG_INT` | 0 | a program that is interrupted and RESUMED, not killed |
 | `ONCE.ELF` | reads fd 0 once and exits | 0 | the reader that leaves early, so a writer gets `SIG_PIPE` |
+| `I.ELF` | `malloc`s 300 blocks, verifies, frees shuffled, reuses | 0 | `malloc`/`free`/`calloc`, and that the heap slot is freed at exit |
+| `J.ELF` | abuses `SYS_MMAP` and `SYS_MUNMAP` | 0 | every refusal the kernel must make, with memory intact |
+| `K.ELF` | prints every `printf` specifier | 0 | `printf`, including the failures it is designed to have |
+
+Four more fixtures are not in the table because their point is elsewhere: `F.ELF`,
+the multi-cluster write test, is self-checking and exits 0 only on an exact
+read-back; `G.ELF`, `COUNT.ELF` and `UPPER.ELF` exist to be joined by `|` (see
+[Pipelines](#pipelines) above). All four are described with their transcripts in
+[user/tests/README.md](../../user/tests/README.md).
 
 ### What `run d.elf` demonstrates
 
@@ -351,21 +362,22 @@ whose entire program is that it does *not* call `sys_wait`.
 
 ```
 > run d.elf
-run: started d.elf
 D: starting E
-ED: not waiting, exiting
-reap (sweeper): task 1 exited (status 0), free frames: 30513, heap used: 1816
+Erun: started d.elf
+D: not waiting, exiting
+reap (sweeper): task 2 exited (status 0), free frames: 29998, heap used: 2200
 run: d.elf exited with status 0
 > EEEEEEEEEEEEEE
-> reap (sweeper): task 2 exited (status 7), free frames: 30585, heap used: 1192
+> reap (sweeper): task 3 exited (status 7), free frames: 30072, heap used: 1448
 ```
 
-That is captured output, pasted as the machine printed it, which is why it looks
-untidy. Two tasks and a shell are printing into one screen with no locking, so a
-line can land in the middle of another one (`Ereap (sweeper):` is an `E` from the
-orphan arriving between the shell's characters), and the order of the `run:` lines
-against the reap line is a scheduling artefact rather than a fixed sequence. E's
-line comes after a `>` because it needed the keypress described below to appear.
+That is captured output, pasted as the machine printed it (after one `run a.elf`,
+so D is task 2 and E task 3), which is why it looks untidy. Two tasks and a shell
+are printing into one screen with no locking, so a line can land in the middle of
+another one (`Erun: started d.elf` is an `E` from the orphan arriving before the
+shell's own line), and the order of the `run:` lines against the reap line is a
+scheduling artefact rather than a fixed sequence. E's line comes after a `>`
+because it needed the keypress described below to appear.
 
 Four things to read out of that:
 
@@ -380,7 +392,7 @@ Four things to read out of that:
   the sweeper drops the tombstone rather than keeping a fact nobody can ask for.
   Seven is distinctive purely so it would be obvious, not plausible, if it ever
   turned up at the prompt.
-- **The free frame count comes back to the baseline** — 30585 here — from a path
+- **The free frame count comes back to the baseline** — 30072 here — from a path
   that had never executed before.
 
 One timing quirk worth knowing: if the machine is completely idle when the orphan
@@ -397,6 +409,46 @@ used:` to it invalidated every document quoting one, all at once and silently.
 Regenerate them from a real boot whenever those fields change, and paste what the
 machine prints rather than editing the old numbers into shape. The same examples
 appear in [`user/tests/README.md`](../../user/tests/README.md).
+
+### What `run h.elf` demonstrates
+
+H is the fixture for the other half of signals: a program that is interrupted and
+**put back**, rather than killed. It installs a `SIG_INT` handler, then prints forty
+`H`s with a delay between each. Press Ctrl-C while it runs, several times if you
+like: each press prints one `[H caught SIG_INT]` line, the `H`s carry on from exactly
+where they stopped, and at the end the program reports how many interrupts it caught
+and exits 0 — not 130, which is what the same key does to `run b.elf`, which has no
+handler.
+
+What is being tested is the resume, not the handler. Printing a line from a handler
+only shows that the kernel forged a call frame and jumped to it; the interesting half
+is the return. The handler's `ret` lands on the trampoline, the trampoline raises
+`SYS_SIGRETURN`, and the kernel copies the saved context back over the live register
+frame. If the run of `H`s came out short, or the final total did not match the number
+of presses, the restore would be wrong. See [signals.md](signals.md).
+
+### What `run g.elf | run once.elf` demonstrates
+
+ONCE is the downstream half of the `SIG_PIPE` test, and the whole program is that it
+does **not** drain its input. `G.ELF` writes 16384 bytes, four times the pipe's
+capacity, so it has to block and resume several times to finish; ONCE reads one
+bufferful, says how much arrived, and exits, which closes the last read end. G's next
+write finds no reader, the kernel raises `SIG_PIPE` on it, and the default action
+kills it with status 141 (128 + 13), so the pipeline ends instead of G spinning
+against a buffer nobody will ever drain. Before signals, that same run left G writing
+forever, and the only symptom was a prompt that never came back.
+
+```
+> run g.elf | run once.elf
+ONCE: read 64 bytes, exiting
+reap (wait):    task 6 exited (status 0), free frames: 29994, heap used: 6312
+reap (wait):    task 5 exited (status 141), free frames: 30072, heap used: 1448
+pipeline exited with status 0
+```
+
+The pipeline's own status is 0 because a pipeline reports its **last** stage's
+status, and ONCE exited normally; G's 141 is on its reap line. Captured output, like
+the transcript above: the free-frame and heap numbers are that boot's.
 
 ## Signals at the prompt
 
@@ -426,14 +478,37 @@ run: count.elf exited with status 0
 
 ```
 > run d.elf
-...
-> ps
+D: starting E
+Erun: started d.elf
+D: not waiting, exiting
+reap (sweeper): task 3 exited (status 0), free frames: 29998, heap used: 2200
+run: d.elf exited with status 0
+> EpEsE
   id  parent  pgid  state    status
   0   -       0     running
-  2   1       1     ready
-> kill 2
-reap (sweeper): task 2 exited (status 130), free frames: 30585, heap used: 1192
+  4   3       3     ready
+> EEEEEEEEEEE
+> reap (sweeper): task 4 exited (status 7), free frames: 30072, heap used: 1448
 ```
+
+`ps` typed while E prints (the `p` and `s` land between the `E`s) shows E as task
+4, parent 3, in group 3: a group the shell is not in. And, on a fresh boot where D
+is task 1 and E task 2, `kill 2` typed the same way:
+
+```
+> run d.elf
+D: starting E
+Erun: started d.elf
+D: not waiting, exiting
+reap (sweeper): task 1 exited (status 0), free frames: 29998, heap used: 2200
+run: d.elf exited with status 0
+> kEiElElE EE2E
+>
+> reap (sweeper): task 2 exited (status 130), free frames: 30072, heap used: 1448
+```
+
+E dies with status 130 (128 + `SIG_INT`) instead of finishing its fifteen rounds,
+and its reap line appears on the next keypress, as above.
 
 **These two exist because the keyboard cannot reach everything, and that is by
 design rather than an oversight.** Ctrl-C is addressed to the foreground group only.
@@ -474,4 +549,7 @@ launches it. See [../building.md](../building.md).
   [decision 0018](../decisions/0018-process-lifecycle-exit-and-wait.md).
 - The sleep behind a blocking `SYS_READKEY`: [blocking.md](blocking.md),
   [decision 0017](../decisions/0017-blocking-and-sleep.md).
+- The `printf` the shell prints numbers with, and the memory a program can ask for:
+  [user-memory.md](user-memory.md) and
+  [decision 0024](../decisions/0024-user-memory-and-libc.md).
 - The decision behind all of this: [decision 0016](../decisions/0016-interactive-shell.md).

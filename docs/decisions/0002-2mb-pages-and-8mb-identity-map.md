@@ -2,7 +2,19 @@
 
 ## Status
 
-Accepted.
+Accepted. Partly superseded — the decision stands, one figure in the body does not.
+
+- **The size of the boot identity map** was widened from 8MB to 32MB by
+  [0009](0009-read-multiboot-map-extend-identity-map.md) (commit `0ac8f8a`).
+  `boot/boot.asm` now fills sixteen PD entries, `PD[0..3]` explicitly (kernel,
+  kernel, user code, user stack) and `PD[4..15]` by a loop as kernel-only spare
+  RAM, so C has memory to work in before it has parsed the Multiboot map and
+  extends the map from 32MB up to real RAM. The body and this file's name keep the
+  original 8MB, which was the decision at the time.
+
+2MB pages and the three-level walk are unchanged. See
+[reference/boot-sequence.md](../reference/boot-sequence.md) and
+[reference/memory-map.md](../reference/memory-map.md) for the current state.
 
 ## Context
 

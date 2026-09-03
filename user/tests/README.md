@@ -2,8 +2,9 @@
 
 These are ring-3 programs that exist to prove a piece of the kernel works. They are
 not part of the machine's runtime: nobody would want them on a computer they were
-using. The shell (`../shell.c`) is the real program, and `../userlib.h` and
-`../user.ld` are the runtime every program here compiles against.
+using. The shell (`../shell.c`) is the real program, and `../userlib.h`,
+`../user.ld` and the ring-3 half of `../../libc/` (`malloc`, `printf`, the string
+and memory functions) are the runtime every program here compiles against.
 
 They build exactly like any other user program — freestanding, static,
 `-mcmodel=small`, linked at `0x400000` — and they land in the **root directory** of
@@ -28,8 +29,8 @@ loader's zero-fill honest: a program with no `.bss` would load correctly even if
 that step were missing.
 
     > run a.elf
-    run: started a.elf
-    AAAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30585, heap used: 1192
+    Arun: started a.elf
+    AAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30072, heap used: 1448
     run: a.elf exited with status 0
 
 This is the baseline for the memory test. Run it ten times and the free frame count
@@ -68,18 +69,18 @@ here: the free path that tears a zombie's address space down, and the branch of
 what reaches them, and the output below shows how.
 
     > run d.elf
-    run: started d.elf
     D: starting E
-    ED: not waiting, exiting
-    reap (sweeper): task 1 exited (status 0), free frames: 30513, heap used: 1816
+    Erun: started d.elf
+    D: not waiting, exiting
+    reap (sweeper): task 2 exited (status 0), free frames: 29998, heap used: 2200
     run: d.elf exited with status 0
     > EEEEEEEEEEEEEE
-    > reap (sweeper): task 2 exited (status 7), free frames: 30585, heap used: 1192
+    > reap (sweeper): task 3 exited (status 7), free frames: 30072, heap used: 1448
 
 Both D and E are reaped by the **sweeper**, and which path frees which is decided
-by where they sit in the task table, not by luck. The table is `shell` = 0, `D` =
-1, `E` = 2. When D exits it wakes the shell, its parent, but `find_next_ready` scans
-forward from the slot *after* D and so reaches E at slot 2 before it wraps back to
+by where they sit in the task table, not by luck. The table is `shell` = 0, `A` =
+1 (from the run above), `D` = 2, `E` = 3. When D exits it wakes the shell, its parent, but `find_next_ready` scans
+forward from the slot *after* D and so reaches E at slot 3 before it wraps back to
 the shell at slot 0: E, not the shell, is what runs next, and it gets a full
 timeslice. The next timer tick enters `schedule` with `current` = E, and
 `reap_sweep` — which runs at the top of every `schedule` and frees any zombie that
@@ -97,7 +98,7 @@ again which path frees D before trusting this output.
 
 Two more things the run shows. The prompt returns while E is still printing,
 because the shell waited for D and not for E and stays usable throughout. And D's
-line reports fewer free frames than E's (30513 against 30585 here): when D is swept
+line reports fewer free frames than E's (29998 against 30072 here): when D is swept
 E is still running and holding its own address space, and E's line is the count
 coming back to the baseline once E is gone too.
 
@@ -194,12 +195,127 @@ means the stage downstream is gone and there is nothing left to do.
     20
     pipeline exited with status 0
 
+## I.ELF — the malloc test
+
+The first program that asks for memory at runtime. It `malloc`s 300 blocks of
+sizes from 1 to 1400 bytes (about 210KB in all, so the heap has to grow past its
+first 64KB slab several times), checks each is 8-byte aligned, writes a pattern
+into each that depends on the block **and** the byte offset, and only then verifies
+every pattern, so a block that overlaps another has already had its pattern
+overwritten by the time the check runs. It frees them in a fixed shuffled order,
+then asks for one 200000-byte block, which fits only if every freed block coalesced
+back into one span **across the slab boundaries**, and which must come back at the
+address of the very first block (first-fit on a heap that is one free block again).
+Then `calloc` on that reused memory, which must be zero, and a 3MB request, which
+must fail with NULL rather than anything louder. It exits **0** only if every check
+passes, with a distinct non-zero status per failure mode (listed at the top of
+`I.c`), and prints one line either way.
+
+    > run i.elf
+    run: started i.elf
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    malloc: heap grow: SYS_MMAP refused another slab
+    I: 300 blocks allocated, verified, freed in shuffled order, and reused
+    reap (wait):    task 2 exited (status 0), free frames: 30072, heap used: 1448
+    run: i.elf exited with status 0
+
+The two lines before the verdict are the 3MB request being refused: the kernel says
+why it declined the slab, malloc says it gave up, and malloc returns NULL, which is
+the outcome being tested. **The reap line is the other half of the test.** malloc
+never gives a slab back, so this program exits holding four slabs it asked for at
+runtime; ten consecutive runs must print the same free frame count and the same
+`heap used` every time, and a count that steps down by a few slabs per run means
+the address-space teardown is not freeing the heap slot with the rest (M2 in
+[decision 0024](../../docs/decisions/0024-user-memory-and-libc.md)).
+
+## J.ELF — the `SYS_MMAP` / `SYS_MUNMAP` abuse test
+
+Every other fixture asks the kernel for something it should grant. J asks for things
+it must **refuse**, and checks that each refusal changed nothing: a zero length, a
+length larger than the whole 2MB heap slot, a release of an address that was never
+mapped, a release of its own code and of its own stack, a release of the second page
+of a region, a release with the wrong length, a second release of a region already
+given back, a ninth region when eight is the cap, and a region that would cross the
+top of the slot. Between the abuses it does the ordinary thing (map, check the memory
+reads as zero, write a pattern, read it back, release), so "the kernel refused it" is
+distinguishable from "the kernel refuses everything". It exits **0** only if every
+call answered as `include/syscalls.h` promises, with a distinct non-zero status per
+check (listed at the top of `J.c`), and prints one line either way.
+
+    > run j.elf
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    run: started j.elf
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MUNMAP rejected an address that is not a region's start
+    syscall: SYS_MMAP rejected: no free region slot
+    syscall: SYS_MMAP rejected a length outside the 2MB heap slot
+    syscall: SYS_MMAP rejected a region that would cross the 2MB ceiling
+    syscall: SYS_MMAP rejected a region that would cross the 2MB ceiling
+    J: every abuse refused, every region released, memory intact
+    reap (wait):    task 3 exited (status 0), free frames: 30072, heap used: 1448
+    run: j.elf exited with status 0
+
+The kernel's `syscall: ... rejected` lines are the refusals, one per abuse, printed
+by the kernel exactly as it prints a rejected out-of-bounds buffer; that the shell's
+`run: started` line lands in the middle of them is scheduler timing. Two things to
+read out of the run. The program is still **running** after each refusal: a kernel
+that unmapped the code slot on request would take J down at its next instruction
+fetch, and one that accepted a 3MB request would strand frames or map over the
+kernel's half of the address space. And the free frame count comes back to the
+baseline `run a.elf` leaves, although the largest thing J maps is the entire slot
+(512 frames). J talks to the syscalls directly rather than through `malloc`, because
+`malloc` is built on this contract and cannot test it. See
+[user-memory.md](../../docs/reference/user-memory.md) and
+[decision 0024](../../docs/decisions/0024-user-memory-and-libc.md).
+
+## K.ELF — the printf test
+
+One line per `printf` specifier, each with values chosen so the output can be
+checked against `K.c` by eye; and, because `printf` returns the number of bytes it
+wrote, every return value is compared with the length the line must have if every
+specifier did its job, so a wrong digit or a format that stopped early is a wrong
+count and a non-zero exit (1 + the index of the failing line). The last three lines
+are the failures `printf` is **designed** to have: `%q` is not a specifier it knows,
+so the format stops there, prints nothing for it and returns -1; and a `%s` given a
+pointer outside the ring-3 address space (a NULL, and 16) is refused before anything
+reads through it. The `%q` line is silenced from the compiler's own format check for
+that one line, which is the check that actually defends a program from a mismatched
+format (M5 in [decision 0024](../../docs/decisions/0024-user-memory-and-libc.md)).
+
+    > run k.elf
+    %d: 0 42 -42
+    %u: 0 4294967295
+    run: started k.elf
+    %x: 0 ff deadbeef
+    %s: hello
+    %c: ToS
+    100% done
+    mixed: answer=42, 2a, !%
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    stop here:
+    bad %s pointers:
+    bad %s pointers:
+    K: 11 lines checked
+    reap (wait):    task 4 exited (status 0), free frames: 30072, heap used: 1448
+    run: k.elf exited with status 0
+
+The 144-character line wraps at the screen's 80 columns; it is one `printf` call,
+longer than the 128-byte staging buffer, so the flush in the middle of a line is
+exercised as well as the one at the end.
+
 ## Why every loop is bounded
 
 A program that never exits used to leave its parent blocked in `SYS_WAIT` with no way
 back short of a reboot, so `run <that program>` would make the shell permanently
-unusable. `A`–`F` therefore run a fixed number of rounds and call `sys_exit` at the
-bottom.
+unusable. `A`–`F` and `I`–`K` therefore run a fixed number of rounds and call `sys_exit` at
+the bottom.
 
 **Signals changed the stakes but not the rule.** Ctrl-C and `kill` can now stop a
 runaway task ([signals.md](../../docs/reference/signals.md)), so a bounded loop is a

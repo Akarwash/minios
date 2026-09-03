@@ -2,7 +2,7 @@
 
 TownOS lets a ring-3 program request kernel services through a single software
 interrupt, `int 0x50`. This page documents the gate, the calling convention, the
-nineteen calls that exist, and the pointer checks that guard the untrusted ones. Read
+twenty-one calls that exist, and the pointer checks that guard the untrusted ones. Read
 from `kernel/syscall.c`, `kernel/isr_stubs.asm`, `kernel/isr.c`,
 `include/syscalls.h`, `drivers/keyboard.c`, and `user/userlib.h`. For the
 rationale and the alternatives considered, see
@@ -18,7 +18,9 @@ and in [shell.md](shell.md); see
 [decision 0022](../decisions/0022-file-descriptors-and-pipes.md). The signal calls
 (`SYS_SIGNAL`, `SYS_KILL`, `SYS_SIGRETURN`, `SYS_SETFG`, `SYS_TASKS`) have their own
 page, [signals.md](signals.md); see
-[decision 0023](../decisions/0023-signals.md).
+[decision 0023](../decisions/0023-signals.md). The memory calls (`SYS_MMAP`,
+`SYS_MUNMAP`) have their own page, [user-memory.md](user-memory.md); see
+[decision 0024](../decisions/0024-user-memory-and-libc.md).
 
 ## The doorway
 
@@ -80,6 +82,18 @@ not do (kernel pages are not user-readable).
 | 16 | `SYS_SIGRETURN` | none | does not return normally | Restores the context saved when a handler was delivered. Only the trampoline calls it. |
 | 17 | `SYS_SETFG` | RDI = pgid | 0, or -1 | Makes that process group the foreground, the one Ctrl-C is addressed to. |
 | 18 | `SYS_TASKS` | RDI = `task_info_t` buffer, RSI = size | number of entries, or -1 | Fills the buffer with one entry per live task. |
+| 19 | `SYS_MMAP` | RDI = length in bytes | a page-aligned address, or -1 | Maps that much fresh, zeroed, anonymous memory into the caller's heap slot. |
+| 20 | `SYS_MUNMAP` | RDI = address, RSI = length | 0, or -1 | Releases a region exactly as `SYS_MMAP` handed it out; anything else is refused. |
+
+**`SYS_MMAP` and `SYS_MUNMAP`** give a program memory it did not declare at compile
+time: a region of whole pages inside the 2MB heap slot at `PD[4]`, placed at the
+lowest address above every region the task still holds, mapped in full before the
+call returns. The kernel records each task's regions in a fixed array of eight and
+will release only an exact `(address, length)` match, so a program cannot unmap its
+own code, its stack, or an address it invented. **Neither blocks**, so neither has
+the RAX-discipline problem below; the asymmetry is worth naming because four calls
+in this kernel do. `malloc` is built on them (`libc/malloc.c`). See
+[user-memory.md](user-memory.md).
 
 **`SYS_RUN` grew a fourth argument in RCX**, the process group the child joins: 0 to
 inherit the caller's (the old behaviour), `SYS_RUN_GROUP_NEW` for a new group led by
@@ -184,7 +198,7 @@ file from one too large for the buffer and report the size instead of a bare
 failure. Its `out_size` pointer is a **write target**: the kernel writes a
 `uint64_t` through it, so the whole `[ptr, ptr+8)` range is bounds-checked with
 `user_range_ok` exactly as `SYS_READFILE` checks its destination buffer — a
-start-only check would let a pointer just below `USER_REGION_END` have the kernel
+start-only check would let a pointer just below `USER_SPACE_END` have the kernel
 write off the end of the region. It returns `(uint64_t)-1` when the file is not
 found (a directory or a non-8.3 name folds into the same error), and like the write
 side it **does not block**, so it has no RAX-discipline problem.
@@ -201,29 +215,33 @@ writing memory it is not allowed to. `kernel/syscall.c` has two shared helpers, 
 every call that takes a pointer uses one of them before it touches a byte.
 
 `user_range_ok(ptr, len)` confirms that all of `[ptr, ptr+len)` lies inside the
-ring-3 region (`USER_REGION_START`..`USER_REGION_END`, i.e. 4-8M, the constants
-`kernel/memory.c` reserves). It is careful about overflow: `ptr + len` can wrap on a
-crafted length and a wrapped sum compares as comfortably small, so `len` is checked
-against the room above `ptr` (`USER_REGION_END - ptr`) rather than by forming the sum.
+ring-3 address space (`USER_REGION_START`..`USER_SPACE_END`, i.e. 4-10M: the code
+and stack slots and, since [decision 0024](../decisions/0024-user-memory-and-libc.md),
+the heap slot, so a malloc'd buffer can be handed to a syscall; the constants are in
+`include/usermem.h` and `kernel/memory.c` reserves the physical frames under all
+three). It is careful about overflow: `ptr + len` can wrap on a crafted length and a
+wrapped sum compares as comfortably small, so `len` is checked against the room
+above `ptr` (`USER_SPACE_END - ptr`) rather than by forming the sum.
 `SYS_WRITE` and `SYS_READ` bound their counted buffers with it — and copy them through
 a kernel staging buffer, since a counted buffer may contain zero bytes and need not be
 NUL-terminated, so `copy_user_string` would be wrong for it. `SYS_LIST`,
 `SYS_READFILE`, and `SYS_WRITEFILE` bound theirs. The **write-target pointers** —
 `SYS_STAT`'s `out_size`, `SYS_PIPE`'s `int[2]`, and `SYS_WAIT`'s `out_id` — are bounded
 the same way before the kernel writes through them, which is not just a read check: a
-pointer just below `USER_REGION_END` could otherwise have the kernel write off the end
+pointer just below `USER_SPACE_END` could otherwise have the kernel write off the end
 of the region.
 
 `copy_user_string(ptr, dst, cap)` copies a NUL-terminated string in from ring 3 with a
 length cap, so a string with no terminator cannot walk off the region: it bounds-checks
-the start pointer, then copies until a NUL, until the cap, or until `USER_REGION_END`,
+the start pointer, then copies until a NUL, until the cap, or until `USER_SPACE_END`,
 whichever comes first, and always NUL-terminates. `SYS_RUN`, `SYS_READFILE`,
 `SYS_WRITEFILE`, `SYS_DELETE`, and `SYS_STAT` copy their filenames in with it.
 
 This is the same category of check as the ELF loader's segment bounds
 ([elf-loading.md](elf-loading.md)). It still checks virtual addresses against the fixed
 region constants rather than walking the caller's page tables, so it is not yet full
-per-process validation — recorded as a TODO in `kernel/syscall.c` and in
+per-process validation, and the heap slot, which starts empty, makes an unmapped
+address inside the span more common than it was — recorded as a TODO in `kernel/syscall.c` and in
 [../project-status.md](../project-status.md) — but it bounds the whole range and caps
 the length. `SYS_WRITE` was once a start-pointer-only stopgap that did neither; when it
 became a counted `(fd, buf, len)` call ([descriptors.md](descriptors.md)) it moved onto
@@ -233,10 +251,13 @@ became a counted `(fd, buf, len)` call ([descriptors.md](descriptors.md)) it mov
 
 `user/userlib.h` shows the caller's half. The raw `int 0x50` is wrapped in
 `always_inline` helpers built on inline asm with explicit register constraints
-(`"a"` = RAX, `"D"` = RDI, `"S"` = RSI, `"d"` = RDX), one per arity: `syscall0`
-through `syscall3`, with `sys_write`, `sys_exit`, `sys_wait`, `sys_readkey`,
-`sys_list`, `sys_run`, `sys_readfile`, `sys_writefile`, `sys_delete`,
-`sys_freecount`, and `sys_stat` over them. `SYSCALL_VECTOR` reaches the `int`
+(`"a"` = RAX, `"D"` = RDI, `"S"` = RSI, `"d"` = RDX, `"c"` = RCX), one per arity:
+`syscall0` through `syscall4`, with `sys_write`, `sys_exit`, `sys_wait`,
+`sys_readkey`, `sys_list`, `sys_run`, `sys_readfile`, `sys_writefile`,
+`sys_delete`, `sys_freecount`, `sys_stat`, `sys_mmap`, `sys_munmap` and the
+descriptor and signal wrappers over them. `sys_write_all` is the loop that retries
+a partial `SYS_WRITE` until everything is written; `sys_print` and `printf`
+(`libc/printf.c`, declared in the same header) are both built on it. `SYSCALL_VECTOR` reaches the `int`
 instruction as an immediate through an `"i"` constraint so the vector stays a named
 constant. `always_inline` is kept: it folds the trap
 directly into the caller, so every instruction the program runs is inside its own
@@ -272,26 +293,34 @@ commands:
   help                 show this list
   clear                clear the screen
   return <text>        print the text back
+  ps                   list the running tasks
+  kill <id> [sig]      send a signal to a task (default 2, interrupt)
 > list
 HELLO.TXT
 TEST.TXT
 BIG.TXT
-A.ELF
 B.ELF
-C.ELF
-SHELL.ELF
 D.ELF
-E.ELF
-HUGE.TXT
 F.ELF
+HUGE.TXT
 COUNT.ELF
-UPPER.ELF
+H.ELF
+A.ELF
+C.ELF
+FTEST.TXT
+E.ELF
 G.ELF
-> read HELLO.TXT
+UPPER.ELF
+ONCE.ELF
+SHELL.ELF
+J.ELF
+I.ELF
+K.ELF
+> read hello.txt
 Hello from FAT32!
 > run a.elf
-run: started a.elf
-AAAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30587, heap used: 616
+Arun: started a.elf
+AAAAAAAAAAAAAAAAAAAreap (wait):    task 1 exited (status 0), free frames: 30072, heap used: 1448
 run: a.elf exited with status 0
 >
 ```
@@ -313,8 +342,9 @@ the parent's RAX. Over the session `-d int` shows only
 timer (`v=40`), keyboard (`v=41`), and syscall (`v=50`) vectors, all at `cpl=3` for
 the ring-3 traps, with no `#GP` (0x0D), no `#PF` (0x0E), no double fault (0x08), no
 triple fault, and no disk IRQ (0x4E). `v=50` now appears only when the shell has
-something to do: over a six second idle window at the prompt the kernel services
-three syscalls, down from 362,648 when `SYS_READKEY` was polled.
+something to do: over a six second idle window at the prompt the `v=50` count did
+not move at all (four syscalls since boot, all before the window), down from 362,648
+when `SYS_READKEY` was polled.
 
 Passing a bad fd, a wrong-direction fd, or an out-of-region buffer to `SYS_WRITE` or
 `SYS_READ` returns `-1` (silently — a rejected descriptor is a routine program error,
@@ -335,6 +365,9 @@ anything from kernel memory.
 - The shell that uses `SYS_READKEY`/`SYS_LIST`/`SYS_RUN`/`SYS_READFILE`, and the
   keyboard ring buffer behind `SYS_READKEY`: [shell.md](shell.md) and
   [decision 0016](../decisions/0016-interactive-shell.md).
+- The memory calls, the region table and the ring-3 libc built on them:
+  [user-memory.md](user-memory.md) and
+  [decision 0024](../decisions/0024-user-memory-and-libc.md).
 - How a syscall sleeps its caller and is re-issued on wake:
   [blocking.md](blocking.md) and
   [decision 0017](../decisions/0017-blocking-and-sleep.md).

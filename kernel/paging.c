@@ -41,13 +41,52 @@ extern uint64_t pd_table[512];
 // precisely the bug worth making unspellable.
 #define PT_ENTRIES  512
 
-// The two PD slots that describe the ring-3 region (boot.asm PD[2]/PD[3]):
+// The three PD slots that describe the ring-3 address space (include/usermem.h):
 //   PD[2]  0x400000-0x5FFFFF : user code
 //   PD[3]  0x600000-0x7FFFFF : user stack
-// The by-value kernel clone SKIPS these two so the user branch can be overridden
+//   PD[4]  0x800000-0x9FFFFF : user heap, filled one SYS_MMAP region at a time
+// The by-value kernel clone SKIPS these three so the user branch can be overridden
 // with private 4KB page tables (paging_map_page) instead of the shared huge page.
+//
+// PD[4] WAS NOT A FREE SLOT, and treating it as one is what the user-memory rung
+// had to get right. boot/boot.asm identity-maps the first 32MB with sixteen huge
+// pages, so PD[4] held the kernel's own mapping of physical 8-10M, which is also
+// the range the frame allocator hands out first. Two consequences, both
+// load-bearing. memory_init reserves physical 8-10M from the pool, because once a
+// task tree is in CR3 the kernel can no longer reach those frames through the
+// identity map (the reservation comment in kernel/memory.c says what breaks). And
+// the clone below must leave PD[4] ABSENT rather than copy the boot entry: next_table
+// tests only PG_PRESENT, so a copied huge-page entry would be followed as if it
+// were a page table, and the first SYS_MMAP would write page-table entries straight
+// into physical 0x800000, whatever lived there, with no fault at the point of the
+// mistake.
 #define USER_PD_INDEX_CODE   2
 #define USER_PD_INDEX_STACK  3
+#define USER_PD_INDEX_HEAP   4
+
+// THE SINGLE PLACE THAT SAYS WHICH PD SLOTS ARE A TASK'S OWN. It was two entries
+// (code, stack) until the user heap made it three, and it is the one thing that has
+// to change if a fourth user region is ever added. Two functions read it and must
+// agree: paging_create_address_space skips exactly these slots when it clones the
+// kernel half, and paging_destroy_address_space frees exactly these slots and
+// nothing else. A slot present in one list and not the other is either a user
+// mapping that leaks at exit (M2 in docs/decisions/0024: the free frame count
+// ratchets down across runs and nothing else looks wrong) or a kernel huge page
+// walked as if it were a page table.
+static const int user_pd_slots[] = { USER_PD_INDEX_CODE, USER_PD_INDEX_STACK, USER_PD_INDEX_HEAP };
+#define USER_PD_SLOT_COUNT  ((int)(sizeof(user_pd_slots) / sizeof(user_pd_slots[0])))
+
+static int is_user_pd_slot(int index) {
+    for (int s = 0; s < USER_PD_SLOT_COUNT; s++) {
+        if (user_pd_slots[s] == index) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Flags for a page SYS_MMAP hands to ring 3: present, writable, reachable at CPL 3.
+#define USER_HEAP_PAGE_FLAGS  (PG_PRESENT | PG_WRITABLE | PG_USER)
 
 // Extract the table index for each level from a virtual address. The x86-64 page
 // walk chops the 48-bit virtual address into four 9-bit indices plus a 12-bit
@@ -126,15 +165,17 @@ address_space_t *paging_create_address_space(void) {
         return NULL;
     }
 
-    // Clone the kernel half BY VALUE: copy every boot PD entry except the two user
-    // slots. Present kernel entries carry the identical huge-page mapping (same
+    // Clone the kernel half BY VALUE: copy every boot PD entry except the three
+    // user slots. Present kernel entries carry the identical huge-page mapping (same
     // physical kernel frame, no user bit); absent entries copy as zero. This is
-    // the copy the tripwire above governs. PD[2]/PD[3] are left zero (not present)
-    // so paging_map_page can install private 4KB page tables there in Stage 3; a
-    // ring-3 touch of an unmapped user address therefore faults, which is the
-    // guard the old shared-region layout never had.
+    // the copy the tripwire above governs. PD[2]/PD[3]/PD[4] are left zero (not
+    // present) so paging_map_page can install private 4KB page tables there (the
+    // loader and the stack mapper at create, SYS_MMAP later); a ring-3 touch of an
+    // unmapped user address therefore faults, which is the guard the old
+    // shared-region layout never had. See user_pd_slots above for why PD[4] must be
+    // skipped and not merely overwritten later.
     for (int i = 0; i < PD_ENTRIES; i++) {
-        if (i == USER_PD_INDEX_CODE || i == USER_PD_INDEX_STACK) {
+        if (is_user_pd_slot(i)) {
             continue;
         }
         pd[i] = pd_table[i];
@@ -180,9 +221,12 @@ int paging_map_page(address_space_t *as, uint64_t virt, uint64_t phys, uint64_t 
 
 // Free every present leaf in one page table, then the table's own frame. `pt_phys`
 // is the physical (== virtual, identity mapped) base of a 512-entry page table
-// hanging under one of the two user PD slots, so every present entry in it is a
-// 4KB frame this task privately owns: a page of its loaded program image, or a page
-// of its stack. Nothing here is shared with any other task or with the kernel.
+// hanging under one of the three user PD slots, so every present entry in it is a
+// 4KB frame this task privately owns: a page of its loaded program image, a page
+// of its stack, or a page of a SYS_MMAP region. Nothing here is shared with any
+// other task or with the kernel. THIS WALK IS WHAT FREES A REGION AT EXIT (M2): it
+// frees the leaves, not just the table, so a heap page a program never released
+// goes back to the pool with the rest of the tree.
 //
 // Freeing the leaves BEFORE the table itself matters: the table is the only record
 // of where the leaves are, so returning it to the pool first loses the addresses of
@@ -212,10 +256,10 @@ void paging_destroy_address_space(address_space_t *as) {
     // `current`, and task_wait only frees a child).
 
     // Mirror paging_create_address_space exactly in reverse: it allocated a PML4, a
-    // PDPT and a PD, wired pml4[0] -> pdpt -> pd, and left the two user PD slots
+    // PDPT and a PD, wired pml4[0] -> pdpt -> pd, and left the three user PD slots
     // empty for paging_map_page to fill with private page tables. So the tree comes
-    // apart leaves first, then the two user page tables, then the three spine
-    // frames, then the handle.
+    // apart leaves first, then the user page tables, then the three spine frames,
+    // then the handle.
     //
     // Every level is tested for PG_PRESENT before it is followed. That is not
     // paranoia about a tree the kernel built correctly: paging_create_address_space
@@ -230,7 +274,7 @@ void paging_destroy_address_space(address_space_t *as) {
             uint64_t pd_phys = pdpt[0] & PTE_ADDR_MASK;
             uint64_t *pd = (uint64_t *)pd_phys;
 
-            // ONLY THESE TWO PD SLOTS, BY NAME, AND NOTHING ELSE. THIS IS THE MOST
+            // ONLY THE NAMED USER PD SLOTS, AND NOTHING ELSE. THIS IS THE MOST
             // DANGEROUS LINE IN THE KERNEL TO GET WRONG.
             //
             // The obvious implementation, "walk all 512 PD entries and free every
@@ -246,10 +290,13 @@ void paging_destroy_address_space(address_space_t *as) {
             // no fault at the point of the mistake.
             //
             // The PG_HUGE test below is a SECOND lock on the same door, not the
-            // primary guard. The primary guard is that this loop has exactly two
-            // iterations over two named indices.
-            const int user_pd_slots[2] = { USER_PD_INDEX_CODE, USER_PD_INDEX_STACK };
-            for (int s = 0; s < 2; s++) {
+            // primary guard. The primary guard is that this loop iterates over the
+            // named indices in user_pd_slots (three today: code, stack, heap) and
+            // over nothing else. The heap slot is in that list because a task's
+            // SYS_MMAP regions live under it: task_exit closes descriptors and knows
+            // nothing about regions, so this walk is the only thing that returns a
+            // region's frames when a program exits without releasing it (M2).
+            for (int s = 0; s < USER_PD_SLOT_COUNT; s++) {
                 int idx = user_pd_slots[s];
                 uint64_t entry = pd[idx];
 
@@ -277,6 +324,94 @@ void paging_destroy_address_space(address_space_t *as) {
     // task, which is invisible in a free-FRAME count and so is exactly the kind of
     // leak that survives the obvious test.
     kfree(as);
+}
+
+// Find the leaf entry for one user virtual address in `as`, or NULL if any level
+// of the walk is absent, or the PD entry is a huge page (which in this kernel can
+// only be a copied kernel entry: not a page table, and not ours to touch). Only the
+// unmap below uses it; the map path goes through next_table, which creates.
+static uint64_t *lookup_pte(address_space_t *as, uint64_t virt) {
+    uint64_t *pml4 = (uint64_t *)as->pml4_phys;
+    uint64_t entry = pml4[PML4_INDEX(virt)];
+    if (!(entry & PG_PRESENT)) {
+        return NULL;
+    }
+    uint64_t *pdpt = (uint64_t *)(entry & PTE_ADDR_MASK);
+    entry = pdpt[PDPT_INDEX(virt)];
+    if (!(entry & PG_PRESENT)) {
+        return NULL;
+    }
+    uint64_t *pd = (uint64_t *)(entry & PTE_ADDR_MASK);
+    entry = pd[PD_INDEX(virt)];
+    if (!(entry & PG_PRESENT) || (entry & PG_HUGE)) {
+        return NULL;
+    }
+    uint64_t *pt = (uint64_t *)(entry & PTE_ADDR_MASK);
+    return &pt[PT_INDEX(virt)];
+}
+
+void paging_unmap_user_range(address_space_t *as, uint64_t base, uint64_t length) {
+    for (uint64_t va = base; va < base + length; va += FRAME_SIZE) {
+        uint64_t *pte = lookup_pte(as, va);
+        if (pte == NULL || !(*pte & PG_PRESENT)) {
+            continue;   // never mapped: a partial run being unwound, nothing to free
+        }
+        free_frame(*pte & PTE_ADDR_MASK);
+        *pte = 0;
+
+        // FLUSH THIS TRANSLATION FROM THE TLB. When SYS_MUNMAP calls this, `as` is
+        // the tree currently in CR3 (the caller's own), and the CPU may have cached
+        // the translation for `va` the last time the program touched it. Clearing
+        // the entry in memory does not clear that cache. Without the invlpg the
+        // program can go on reading and writing the frame it just released, through
+        // the stale translation, after free_frame has handed that frame to another
+        // task's page table or heap page: a silent cross-task corruption with no
+        // fault anywhere near the cause. invlpg on a tree that is NOT in CR3 (the
+        // unwind inside paging_map_user_range runs on the caller's tree too, so today
+        // that case does not arise) is harmless: it flushes an entry for an address
+        // whose current translation is simply not the one being removed.
+        __asm__ __volatile__("invlpg (%0)" : : "r"(va) : "memory");
+    }
+}
+
+int paging_map_user_range(address_space_t *as, uint64_t base, uint64_t length) {
+    uint64_t done = 0;
+    while (done < length) {
+        uint64_t frame = alloc_frame();
+        if (frame == 0) {
+            // M3, PARTIAL MAPPING FAILURE. Page 40 of 100 found no frame. Returning
+            // now would leave pages 1 to 39 mapped in a region the caller is about to
+            // be told does not exist: nothing records them, SYS_MUNMAP would refuse
+            // the address, and they would come back only when the task exits, if
+            // it ever does. A program that retries a failing SYS_MMAP in a loop would
+            // strand a few dozen frames per attempt with the free count stepping down
+            // each time. So the run is unwound here, the same discipline as
+            // task_create_from_file tearing down a partial address space and
+            // alloc_chain in fs/fat32.c freeing a partial cluster chain: a call that
+            // fails costs nothing.
+            paging_unmap_user_range(as, base, done);
+            return -1;
+        }
+
+        // ZERO THE FRAME. alloc_frame returns whatever the last owner left in it:
+        // another task's stack, a file's bytes, a page table. Handing that to a
+        // ring-3 program is an information leak across the isolation this whole
+        // module exists to provide, and it is also what makes a fresh region
+        // reliably all-zero, which calloc and the p5 allocator's "uninitialised is
+        // zero" block state both quietly depend on. The frame is written through
+        // the identity map, so this works whether or not `as` is in CR3.
+        memset((void *)frame, 0, FRAME_SIZE);
+
+        if (paging_map_page(as, base + done, frame, USER_HEAP_PAGE_FLAGS) != 0) {
+            // A page TABLE could not be allocated. The frame we hold is not in the
+            // tree yet, so the unwind below cannot see it; free it by hand first.
+            free_frame(frame);
+            paging_unmap_user_range(as, base, done);
+            return -1;
+        }
+        done += FRAME_SIZE;
+    }
+    return 0;
 }
 
 // Load an address space into CR3. CR3 holds a PHYSICAL address; everything below

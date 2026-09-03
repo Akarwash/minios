@@ -18,12 +18,21 @@ are preconditions for later ones.
    used: the whole identity map lives in the low region the first PML4 entry
    covers.
 3. **PDPT[0] points at the PD**, present and writable.
-4. **PD[0..3] identity-map the first 8MB** with 2MB pages. Entry N maps virtual
+4. **PD[0..15] identity-map the first 32MB** with 2MB pages. Entry N maps virtual
    `N * 0x200000` to the same physical address (fake address equals real
    address). The `PS` (huge) bit is mandatory: it tells the CPU this entry is a
    2MB page and to stop the walk here, instead of chasing a fourth-level page
-   table that does not exist. Four entries cover `0x000000` to `0x7FFFFF`, which
-   includes the VGA text buffer at `0xB8000` and the kernel at 1M.
+   table that does not exist. The first four entries are written explicitly, one
+   per line, because their privilege differs: `PD[0]` and `PD[1]` (`0x000000` to
+   `0x3FFFFF`, the kernel, the VGA text buffer at `0xB8000`, the kernel at 1M)
+   are kernel-only, and `PD[2]` and `PD[3]` (`0x400000` to `0x7FFFFF`) carry the
+   user bit for the ring-3 code and stack regions. The remaining twelve,
+   `PD[4..15]` (`0x800000` to `0x1FFFFFF`), are filled by a loop as kernel-only
+   spare RAM: the memory C works in before it has parsed the Multiboot map, and
+   where the frame allocator's pool begins. The map is 32MB rather than the 8MB
+   originally decided because C cannot learn how much RAM there is until it runs,
+   and it cannot run until this map exists; C only ever adds entries at 32MB and
+   up ([memory-map.md](memory-map.md)).
 5. **Enable PAE** by setting CR4 bit 5. Physical Address Extension is required
    for long mode. Without it, enabling paging in the next steps would just turn
    on 32-bit paging.
@@ -54,7 +63,7 @@ Before paging, the CPU fetches instructions using physical addresses. The instan
 instruction to fetch, goes through the page tables. If those tables do not map the
 currently-executing code to itself, the next fetch lands somewhere invalid and the
 CPU triple faults on its own instruction stream. Identity mapping the region that
-holds the running code (the first 8MB, which covers the kernel at 1M) guarantees
+holds the running code (the first 32MB, which covers the kernel at 1M) guarantees
 the address does not change across the transition. That is the whole reason the
 tables are built before paging is enabled rather than after.
 
@@ -62,7 +71,10 @@ tables are built before paging is enabled rather than after.
 
 - The bootstrap GDT and the kernel GDT that replaces it: [gdt.md](gdt.md).
 - Where the page tables and stacks live: [memory-map.md](memory-map.md).
-- Why 2MB pages and an 8MB identity map:
-  [decision 0002](../decisions/0002-2mb-pages-and-8mb-identity-map.md).
+- Why 2MB pages, and the original 8MB identity map:
+  [decision 0002](../decisions/0002-2mb-pages-and-8mb-identity-map.md). The map
+  was widened to 32MB when the Multiboot map began extending it
+  ([decision 0009](../decisions/0009-read-multiboot-map-extend-identity-map.md));
+  the ADR keeps its name and its body, and its Status says so.
 - The concept behind paging and long mode:
   [`../../learnings/`](../../learnings/README.md).

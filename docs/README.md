@@ -44,12 +44,13 @@ ADR body and changelog entry exactly as it was written.
 | [reference/gdt.md](reference/gdt.md) | The kernel GDT and TSS: selector table, descriptor layouts, and the bootstrap-vs-kernel GDT split |
 | [reference/idt.md](reference/idt.md) | The IDT and interrupt entry path: gate format, PIC remap, the 48 stubs, dispatch, and EOI |
 | [reference/user-mode.md](reference/user-mode.md) | The drop to ring 3: the forged `iretq` frame, the ring-3 selectors and stack, the user bit ANDed down the page walk, and how the isolation is proven |
-| [reference/syscalls.md](reference/syscalls.md) | The `int 0x50` syscall gate: the single DPL 3 doorway, the register calling convention, the fourteen calls, and the untrusted-pointer checks |
+| [reference/syscalls.md](reference/syscalls.md) | The `int 0x50` syscall gate: the single DPL 3 doorway, the register calling convention, the twenty-one calls, and the untrusted-pointer checks |
 | [reference/descriptors.md](reference/descriptors.md) | File descriptors: the per-task table, the console/pipe kinds, the 0-input/1-output convention, and the read/write/close/pipe calls |
 | [reference/pipes.md](reference/pipes.md) | Pipes: the ring buffer, the reader/writer counts, the block/wake rules, and how end-of-file works (why empty is not EOF, and why closing wakes) |
 | [reference/signals.md](reference/signals.md) | Signals: raising vs delivering, the forged handler frame and the trampoline, `sigreturn`, process groups and the declared foreground, Ctrl-C and Ctrl-D |
 | [reference/scheduling.md](reference/scheduling.md) | The round-robin preemptive scheduler: the interrupt frame as the task, the forged frame for a never-run task, the in-place frame overwrite and CR3 load, the task states, the zombie sweeper, and the startup race |
 | [reference/heap.md](reference/heap.md) | The kernel heap: header/footer boundary tags, split/coalesce, the frame-allocator seam, and interrupt safety |
+| [reference/user-memory.md](reference/user-memory.md) | User memory and the ring-3 libc: the heap slot, `SYS_MMAP`/`SYS_MUNMAP` and the per-task region table, mapping and unmapping with the unwind and the TLB flush, freeing at exit, the second port of the allocator as `malloc`, `printf`, and how `libc/` reaches ring 3 |
 | [reference/disk.md](reference/disk.md) | The polled ATA PIO disk driver: the 512-byte block model, the port layout, the read and write flows, and the driver-vs-filesystem layering |
 | [reference/fat32.md](reference/fat32.md) | The read/write FAT32 filesystem: the on-disk layout, the boot sector fields, cluster-to-block arithmetic, FAT chains and the 28-bit mask, directory entries and 8.3 names, the read path, and the write path (chain alloc/free, directory growth, both FAT copies, the commit ordering, FSInfo) |
 | [reference/elf-loading.md](reference/elf-loading.md) | The ELF64 program loader: the manifest, the header and program header fields used, validation and the segment bounds check, the load loop and the zero-fill, and the separate user build |
@@ -84,6 +85,7 @@ ADR body and changelog entry exactly as it was written.
 - [0021 — Expose `fat32_stat` to ring 3 as `SYS_STAT`](decisions/0021-sys-stat.md) — Add an eleventh syscall that reports a file's size without reading it, so the shell's `read` can stat first and tell a missing file (`read: no such file: X`) from one too big (`read: X is N bytes, the buffer holds M`) from a disk error; removes the unreachable truncation notice, and takes no partial reads and no offset (that would change `SYS_READFILE`).
 - [0023 — Signals](decisions/0023-signals.md) — An interrupt one layer up, with no hardware behind it: a pending set, delivery only on the way out to ring 3, default actions and catchable handlers with a hand-forged call frame and a program-supplied trampoline, process groups so Ctrl-C addresses a job, a declared (never inferred) foreground, `SYS_KILL`/`SYS_TASKS` for tasks the keyboard cannot reach, `SIGPIPE`, and Ctrl-D. Includes a catalogue of the eight ways this goes wrong (S1–S8), six of them silently.
 - [0022 — File descriptors and pipes](decisions/0022-file-descriptors-and-pipes.md) — Give every task a fixed table of open destinations, make pipes one kind of entry in it, reshape `SYS_WRITE` to `(fd, buf, len)` and add `SYS_READ`/`SYS_CLOSE`/`SYS_PIPE`, pass ends to children through `SYS_RUN`, and teach the shell `|`. Includes the EOF argument (empty is not finished; closing must wake) and a catalogue of the six silent ways pipes hang or corrupt (B1–B6).
+- [0024 — User memory and a fuller libc](decisions/0024-user-memory-and-libc.md) — Anonymous, eager `SYS_MMAP`/`SYS_MUNMAP` into a 2MB heap slot at `PD[4]` (which was the identity map of physical 8-10M, now reserved), a fixed array of eight regions per task, the kernel heap ported a second time as a ring-3 `malloc` on top, a six-specifier `printf` whose real defence is the compiler's format attribute, `libc/` compiled twice so it reaches ring 3, and the six ways this goes wrong (M1–M6), four of them silently. Phase 1 ends here.
 
 ## Status
 
@@ -97,7 +99,8 @@ that disk as ELF64 binaries. The shell itself is one of those ring-3 programs.
   `townos.bin`. `make run` boots it under QEMU: the banner appears, the timer ticks
   on IRQ 0, the keyboard delivers keypresses on IRQ 1, and `SHELL.ELF` runs at
   ring 3, dispatching `list`, `read`, `write`, `delete`, `free`, `run`, `help`,
-  `clear`, and `return` through the syscall gate. With nobody typing, the shell
+  `clear`, `return`, `ps` and `kill` through the syscall gate, and printing with
+  `printf`. A program can `malloc` at run time. With nobody typing, the shell
   sleeps and the CPU halts between timer ticks rather than spinning.
 
 The full feature list, the things that are still deliberately absent (argv, dynamic
