@@ -13,8 +13,9 @@ the known limitations. It is a factual snapshot, not a roadmap.
 ## What works
 
 - The 32 to 64 long-mode climb in `boot/boot.asm`: 2MB-page identity map of the
-  first 8MB, PAE, EFER.LME, paging, a bootstrap GDT, and the far jump into 64-bit
-  code that calls `kernel_main`.
+  first 32MB (sixteen entries: four written explicitly, twelve by a loop), PAE,
+  EFER.LME, paging, a bootstrap GDT, and the far jump into 64-bit code that calls
+  `kernel_main`.
 - The kernel GDT and 64-bit TSS (`kernel/gdt.c`, `kernel/gdt_flush.asm`).
 - The IDT and the full interrupt path: 256-entry table, PIC remap to the
   self-describing vector map (hardware IRQs at 0x40-0x4F, every vector defined in

@@ -928,6 +928,11 @@ corrected on sight, or the source.
   false-positive test result in the signals rung.
 - `drivers/screen.c`'s scroll copied overlapping ranges with `memcpy`, which
   worked only because the copy happens to run forward; it uses `memmove`.
+- `docs/reference/boot-sequence.md` and `docs/project-status.md` said the boot
+  identity map was the first 8MB. It has been 32MB (`PD[0..15]`, four entries
+  written explicitly and twelve by a loop) since the Multiboot rung; the figure
+  had been copied from the original decision rather than from `boot/boot.asm`.
+  ADR 0002 keeps its name and body and gains a Status note.
 
 - `make` with no target now builds the kernel. It had been reporting
   `user/SHELL.ELF is up to date` and building nothing else: GNU make takes the
