@@ -139,9 +139,23 @@ it already was.
 You are changing the wheels while the car is moving, and identity mapping is the
 trick that makes the car not notice.
 
-TownOS identity-maps the first 8MB, which covers the VGA text buffer at 0xB8000 and
-the kernel loaded at 1MB. Four entries of 2MB each. Enough to survive the
-transition, and small enough to build by hand in assembly before any C exists.
+TownOS identity-maps the first 32MB. Sixteen entries of 2MB each, covering the VGA
+text buffer at 0xB8000 and the kernel loaded at 1MB with a great deal of room to
+spare. Enough to survive the transition, and simple enough to build by hand in
+assembly before any C exists.
+
+The first four entries are written out one per line, because their privilege
+differs and it is worth being able to read it off:
+
+    PD[0]  0x000000-0x1FFFFF   kernel: kernel code and data, VGA, the kernel stack
+    PD[1]  0x200000-0x3FFFFF   kernel
+    PD[2]  0x400000-0x5FFFFF   USER: where a ring-3 program's code will live
+    PD[3]  0x600000-0x7FFFFF   USER: where its stack will live
+
+The remaining twelve are filled by a loop, because they are uniform: 8MB to 32MB,
+kernel only, no user bit. That range is not decoration. It is the memory C works in
+before it has parsed the Multiboot map, and it is where the frame allocator's pool
+begins.
 
 ## Rule 7: the identity map is scaffolding
 
@@ -168,7 +182,8 @@ The order in `boot/boot.asm`, and every step is a precondition for a later one:
 2. **Link the levels.** PML4[0] points at the PDPT, PDPT[0] points at the PD. Only
    entry 0 of each, because the whole identity map lives in the low region entry 0
    covers.
-3. **Identity-map 8MB** with four 2MB pages in the PD.
+3. **Identity-map 32MB** with sixteen 2MB pages in the PD. Four written explicitly,
+   twelve in a loop.
 4. **Enable PAE.** Physical Address Extension is required for long mode. Turn on
    paging without it and you get 32-bit paging instead, which is not an error, just
    silently the wrong thing.
@@ -194,7 +209,7 @@ finish the climb, and that table is chapter 9.
 That is a satisfying place for this chapter to end, because it is exactly the shape
 of the whole climb: every step exists to make the next one legal.
 
-## Why 2MB pages, and why only 8MB
+## Why 2MB pages, and why 32MB
 
 Two decisions worth understanding rather than accepting.
 
@@ -204,11 +219,33 @@ no fourth table below me." That removes an entire level of tables from the boot
 code, which matters a great deal when you are writing it in assembly with no
 allocator and no error handling.
 
-**8MB** because it is the smallest round number that covers everything the boot
-code needs: the VGA buffer low down, and the kernel at 1MB. Four PD entries. Making
-it larger costs nothing at boot but describes memory nobody has looked at yet.
+**32MB** because the boot map has to be built with no knowledge of how much memory
+the machine actually has. The Multiboot map that answers that question is parsed
+later, in C, and C cannot run until this map exists. So the boot code picks a
+figure that is certainly safe and comfortably larger than the kernel needs, and
+leaves C room to work in before it extends the map to cover real RAM.
 
-Both are recorded in `docs/decisions/0002-2mb-pages-and-8mb-identity-map.md`.
+C only ever adds entries at 32MB and up. It never touches these low sixteen, which
+map the running kernel. That division is what makes the boot map a fixed, known
+quantity rather than something that shifts underneath the code that is standing
+on it.
+
+### A fossil worth noticing
+
+The ADR for this is called
+`docs/decisions/0002-2mb-pages-and-8mb-identity-map.md`, and the figure in its
+filename is not the figure in the code.
+
+That is not a mistake. The original decision genuinely was 8MB, which was the
+smallest round number covering the VGA buffer and the kernel. The map was widened
+later, and the ADR keeps its name because an ADR records what was decided at a
+moment, not what is true now. Its Status field is where the widening belongs.
+
+It is worth knowing this one is there, because it is exactly the kind of stale
+number that propagates: it was copied into the reference page, and from there into
+an earlier draft of this chapter, and from there into chapter 24, before anybody
+checked it against `boot.asm`. When a figure appears in three documents and one
+source file, the source file is the one that is right.
 
 ## What this still is not
 

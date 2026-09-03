@@ -13,7 +13,8 @@ PD[2]   0x400000-0x5FFFFF   code, data, bss   (loaded from the ELF)
 PD[3]   0x600000-0x7FFFFF   stack
 ```
 
-`PD[4]` through `PD[511]` are unmapped and unused.
+Those are the only two slots in a task's page directory that carry the user bit.
+Everything else in that directory is either kernel or absent.
 
 So a program has exactly the memory it declared at compile time, plus a stack. That
 is why every fixture in `user/tests/` uses fixed static buffers, why `F.c` writes
@@ -80,6 +81,29 @@ PD[4]   0x800000   heap      grows up, 2MB ceiling
 
 Nothing to collide with. The bound is the top of the slot and the check is one
 comparison.
+
+### Except PD[4] was not free
+
+The slot was available in a task's *private* directory, and that is what made it
+look empty. It was not free in the kernel's.
+
+`boot/boot.asm` identity-maps the first 32MB (chapter 8), and PD[4] is part of that
+map: physical 8MB to 10MB, kernel-only. Worse, that range is the first the frame
+allocator hands out, so at the moment this was proposed the shell's own page tables
+were living at 0x810000.
+
+Handing PD[4] to user programs therefore meant two changes rather than none:
+reserving those 512 frames in `memory_init` so the allocator never gives them out,
+and leaving the slot absent when the kernel half is cloned into a new address
+space, so a task's PD[4] means its heap rather than the kernel's spare RAM. The
+free-frame baseline dropped by 512 as a result, from 30585 to 30072.
+
+The lesson is about how the mistake survived. An address space has two views: what
+the *task* has mapped, and what the *kernel* has mapped through the identity map.
+An address can be free in one and occupied in the other, and the phrase "that slot
+is unused" is meaningless until you say which. Chapter 14's point, that an address
+is only meaningful relative to a map, applies to the kernel's own map as much as to
+a program's.
 
 That simplicity is borrowed, though. It exists because your stacks cannot grow,
 which is itself a limitation. A kernel with growable stacks gets the collision
@@ -230,6 +254,11 @@ compiler attribute.
 - **No growable stack.** Still a fixed 2MB, and a program that recurses too deeply
   runs off the end of it into unmapped space.
 - **`printf` has no width or precision**, no floats, and no `%p`.
+- **The heap slot is carved out of the identity map**, not found in empty space.
+  512 frames of physical 8MB to 10MB are reserved at boot and never handed to the
+  frame allocator, whether or not any program ever calls `mmap`. A kernel that
+  wanted user memory anywhere in physical RAM would decouple the two, which means
+  giving up the convenience of the identity map for that range.
 
 ## Exercises
 
@@ -255,3 +284,6 @@ compiler attribute.
    codebase.
 9. `printf("%s %s", one_thing)` cannot be caught at runtime. Explain why, and name
    the thing that does catch it.
+10. `PD[4]` was free in a task's page directory and occupied in the kernel's.
+    Explain how both can be true at once, and describe what would have gone wrong
+    had the frames not been reserved.
