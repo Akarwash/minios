@@ -1,6 +1,6 @@
 # TownOS
 
-A hobby x86-64 operating system kernel built from scratch in C and assembly.
+A hobby x86-64 operating system kernel built from scratch in C and assembly (not for real world use, just for me to learn how an OS works and the decisions made to make it work in this way).
 
 TownOS boots via Multiboot, climbs the CPU into 64-bit long mode, sets up the GDT
 and TSS, and boots into an interrupt-driven interactive shell. It is a learning
